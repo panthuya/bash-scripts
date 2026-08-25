@@ -5,11 +5,11 @@ kcu() {
     local contexts=(
         "ack-nextapp"
         "ack-prod-shared"
-        "onprem-prod"
         "devops-rbac"
+        "onprem-dr-k0s"
         "ack-nonprod"
         "onprem-nonprod-k0s"
-        "k3d-mycluster"
+        "kind-mycluster"
     )
 
     local context_count=${#contexts[@]}
@@ -33,12 +33,11 @@ kcu() {
 
     local selected="${contexts[$choice]}"
 
-    # --- THE FIX STARTS HERE ---
     # 1. Create a unique kubeconfig file for THIS terminal session only
     # This uses the Process ID ($$) to ensure uniqueness
     export KUBECONFIG_SAVED="$KUBECONFIG"
     local session_config="/tmp/kubeconfig-session-$$"
-    
+
     # 2. If the session file doesn't exist yet, "flatten" your merged configs into it
     if [[ ! -f "$session_config" ]]; then
         kubectl config view --flatten > "$session_config"
@@ -47,7 +46,6 @@ kcu() {
 
     # 3. Tell THIS terminal to use the private file
     export KUBECONFIG="$session_config"
-    # --- THE FIX ENDS HERE ---
 
     if kubectl config use-context "$selected" --kubeconfig="$KUBECONFIG"; then
         echo "Switched session to: $selected"
@@ -70,12 +68,14 @@ PROMPT='%{$fg[cyan]%}⚓ $(kube_context)%{$reset_color%} '$PROMPT
 # Kubernetes / CLI paths
 # -------------------------------
 alias k=kubectl
-export KUBECONFIG=~/.kube/ack-nextapp.yaml:~/.kube/ack-nonprod.yaml:~/.kube/ack-prod-shared.yaml:~/.kube/onprem-nonprod-k0s.yaml:~/.kube/onprem-prod.yaml:~/.kube/k0s-onprem-prod.yaml
+export KUBECONFIG=:~/.kube/ack-nonprod.yaml:~/.kube/ack-prod-shared.yaml:~/.kube/onprem-nonprod-k0s.yaml:~/.kube/onprem-prod.yaml:~/.kube/k0s-onprem-prod.yaml:~/.kube/dr-kubeconfig.yaml:~/.kube/ack-nextapp.yaml
 
+#export KUBECONFIG=$HOME/.kube/ack-nextapp-direct.yaml
 export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
 export PATH=$PATH:/opt/wso2/apictl
 export PATH=$PATH:/usr/local/go/bin
-alias mydir='cd /mnt/c/Users/panthuya/Downloads/'
+export mydir='/mnt/c/Users/panthuya/Downloads/'
+alias ks="kustomize"
 
 # -------------------------------
 # NVM
@@ -83,3 +83,12 @@ alias mydir='cd /mnt/c/Users/panthuya/Downloads/'
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+source <(flux completion zsh)
+
+# opencode
+export PATH=/home/panthuya/.opencode/bin:$PATH
+export PATH="$HOME/.local/bin:$PATH"
+
+
+# Added by Antigravity CLI installer
+export PATH="/home/panthuya/.local/bin:$PATH"
