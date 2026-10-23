@@ -1,0 +1,1859 @@
+#!/usr/bin/env python3
+"""
+fvpn - a free-VPN command line client for macOS.
+
+Backend : mihomo (Clash.Meta) single binary, installed with `brew install mihomo`
+Nodes   : free public subscription lists and/or your own subscription URL/file
+Routing : TUN mode (every app, needs admin) or system-proxy mode (no root)
+
+Usage:  fvpn -c            connect
+        fvpn -d            disconnect
+        fvpn -s            status
+        fvpn -l            list nodes + latency
+        fvpn -t            re-test all nodes, show the best
+        fvpn -p 3          pin node #3 from `fvpn -l`
+        fvpn -a            back to automatic best node
+        fvpn -i <url|file> add a subscription
+        fvpn -u            refresh node list
+        fvpn logs          tail the backend log
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+# ---------------------------------------------------------------- constants
+
+VERSION = "1.0.0"
+APP = "fvpn"
+
+# If launched through `sudo fvpn ...`, stay in the invoking user's home.
+if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+    HOME = Path(pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir)
+else:
+    HOME = Path.home()
+
+DIR = Path(os.environ.get("FVPN_HOME", HOME / ".fvpn"))
+SOURCES = DIR / "sources.conf"
+META = DIR / "meta.json"
+RUNTIME = DIR / "runtime.json"
+CONFIG = DIR / "config.yaml"
+SECRET_FILE = DIR / "secret"
+PROVIDERS = DIR / "providers"
+BACKUP = DIR / "proxy_backup.json"
+LOG_DIR = DIR / "logs"
+LOG = LOG_DIR / "mihomo.log"
+PIDFILE = DIR / "mihomo.pid"
+
+MAX_NODES = int(os.environ.get("FVPN_MAX_NODES", "250"))
+MAX_CANDIDATES = int(os.environ.get("FVPN_MAX_CANDIDATES", "4000"))
+PREF_MIXED_PORT = int(os.environ.get("FVPN_PORT", "7890"))
+PREF_CTRL_PORT = int(os.environ.get("FVPN_CTRL_PORT", "9090"))
+HEALTH_URL = "https://www.gstatic.com/generate_204"
+USER_AGENT = f"{APP}/{VERSION}"
+
+# Public lists that answered healthy when this tool was written. Dead ones are
+# skipped automatically, so the list can safely go stale.
+DEFAULT_SOURCES = [
+    "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity",
+    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
+]
+
+RESERVED_NAMES = {
+    "AUTO", "PROXY", "DIRECT", "REJECT", "GLOBAL", "COMPATIBLE",
+    "PASS", "PASS-RULE", "REJECT-DROP",
+}
+
+JUNK_NAME = re.compile(
+    r"(剩余|到期|过期|订阅|官网|机场|发布页|白嫖|试用|广告|expire|renew|traffic|"
+    r"subscribe|telegram|t\.me|https?://)",
+    re.I,
+)
+
+SS_CIPHERS = {
+    "aes-128-gcm", "aes-192-gcm", "aes-256-gcm",
+    "aes-128-cfb", "aes-192-cfb", "aes-256-cfb",
+    "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
+    "rc4-md5", "chacha20-ietf", "xchacha20",
+    "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
+    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305",
+}
+SS_ALIASES = {
+    "chacha20-poly1305": "chacha20-ietf-poly1305",
+    "chacha20": "chacha20-ietf",
+    "xchacha20-poly1305": "xchacha20-ietf-poly1305",
+    "aes256-gcm": "aes-256-gcm",
+    "aes128-gcm": "aes-128-gcm",
+}
+
+TTY = sys.stdout.isatty()
+NO_COLOR = bool(os.environ.get("NO_COLOR"))
+
+
+def col(txt: str, code: str) -> str:
+    if not TTY or NO_COLOR:
+        return txt
+    return f"\033[{code}m{txt}\033[0m"
+
+
+def dim(t: str) -> str:
+    return col(t, "2")
+
+
+def bold(t: str) -> str:
+    return col(t, "1")
+
+
+def green(t: str) -> str:
+    return col(t, "32")
+
+
+def red(t: str) -> str:
+    return col(t, "31")
+
+
+def yellow(t: str) -> str:
+    return col(t, "33")
+
+
+def cyan(t: str) -> str:
+    return col(t, "36")
+
+
+def say(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":
+    say(red(f"fvpn: {msg}"))
+    sys.exit(code)
+
+
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def human_uptime(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+# ---------------------------------------------------------------- fs helpers
+
+def ensure_dirs() -> None:
+    DIR.mkdir(parents=True, exist_ok=True)
+    PROVIDERS.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DIR, 0o700)
+    if not SOURCES.exists():
+        SOURCES.write_text(
+            "# fvpn sources - one subscription URL or local file per line.\n"
+            "# Add your own with: fvpn -i <url>\n"
+            + "\n".join(DEFAULT_SOURCES) + "\n"
+        )
+
+
+def load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def save_json(path: Path, data) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    tmp.replace(path)
+
+
+def secret() -> str:
+    ensure_dirs()
+    if not SECRET_FILE.exists():
+        SECRET_FILE.write_text(base64.urlsafe_b64encode(os.urandom(18)).decode())
+        os.chmod(SECRET_FILE, 0o600)
+    return SECRET_FILE.read_text().strip()
+
+
+def mihomo_bin() -> str:
+    for cand in (shutil.which("mihomo"), "/opt/homebrew/bin/mihomo", "/usr/local/bin/mihomo"):
+        if cand and Path(cand).exists():
+            return cand
+    die("mihomo is not installed. Run: brew install mihomo")
+
+
+def free_port(start: int) -> int:
+    for port in range(start, start + 40):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    die(f"no free port near {start}")
+
+
+# ---------------------------------------------------------------- http / api
+
+def http_get(url: str, timeout: int = 45) -> bytes:
+    req = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def api(path: str, method: str = "GET", body=None, timeout: float = 3.0, port: int | None = None):
+    if port is None:
+        rt = load_json(RUNTIME, {})
+        port = rt.get("ctrl", PREF_CTRL_PORT)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        method=method,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {secret()}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else {}
+
+
+def api_ok() -> bool:
+    try:
+        api("/version", timeout=1.0)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- process
+
+def pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def running(rt: dict | None = None) -> bool:
+    rt = rt if rt is not None else load_json(RUNTIME, None)
+    if not rt:
+        return False
+    pid = int(rt.get("pid") or 0)
+    if not pid_alive(pid):
+        return False
+    try:
+        cmd = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        if "mihomo" in cmd:
+            return True
+    except Exception:
+        pass
+    return api_ok()
+
+
+def find_mihomo_pids() -> list[int]:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", f"mihomo -d {DIR}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        return [int(x) for x in out.split() if x.isdigit()]
+    except Exception:
+        return []
+
+
+def ensure_sudo() -> bool:
+    if os.geteuid() == 0:
+        return True
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        return True
+    say(dim("TUN mode needs admin rights once (it routes every app)."))
+    return subprocess.run(["sudo", "-v"]).returncode == 0
+
+
+def run_ns(*args: str, timeout: float = 15) -> subprocess.CompletedProcess:
+    """networksetup wrapper; retries with cached sudo when needed."""
+    res = subprocess.run(["networksetup", *args], capture_output=True, text=True, timeout=timeout)
+    if res.returncode != 0 and os.geteuid() != 0:
+        res2 = subprocess.run(
+            ["sudo", "-n", "networksetup", *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if res2.returncode == 0:
+            return res2
+    return res
+
+
+# ---------------------------------------------------------------- URI parsing
+# Every parser returns a Clash/mihomo proxy dict or None when unsupported.
+
+def b64(text: str) -> bytes:
+    s = re.sub(r"\s+", "", text).replace("-", "+").replace("_", "/")
+    if len(s) % 4:
+        s += "=" * (4 - len(s) % 4)
+    return base64.b64decode(s, validate=False)
+
+
+def b64_text(text: str) -> str:
+    try:
+        return b64(text).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def q1(qs: dict, *keys: str, default: str = "") -> str:
+    for k in keys:
+        vals = qs.get(k)
+        if vals and vals[0] != "":
+            return vals[0]
+    return default
+
+
+def truthy(v) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def clean_name(raw: str | None, fallback: str) -> str:
+    name = urllib.parse.unquote(raw or "").strip()
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip(" -|#")
+    if not name:
+        name = fallback
+    return name[:64]
+
+
+def split_hostport(hp: str) -> tuple[str, int] | None:
+    hp = hp.strip().strip("/")
+    if hp.startswith("["):  # [v6]:port
+        m = re.match(r"\[([^\]]+)\]:(\d+)", hp)
+        if not m:
+            return None
+        return m.group(1), int(m.group(2))
+    if hp.count(":") != 1:
+        return None
+    host, port = hp.rsplit(":", 1)
+    if not port.isdigit():
+        return None
+    return host, int(port)
+
+
+def apply_transport(d: dict, qs: dict, network: str, *, host: str = "", path: str = "", service: str = "") -> dict:
+    network = (network or "tcp").lower()
+    if network in ("tcp", "raw", ""):
+        return d
+    if network == "ws":
+        d["network"] = "ws"
+        opts = {"path": path or "/"}
+        if host:
+            opts["headers"] = {"Host": host}
+        d["ws-opts"] = opts
+    elif network == "grpc":
+        d["network"] = "grpc"
+        svc = service or path.lstrip("/")
+        if svc:
+            d["grpc-opts"] = {"grpc-service-name": svc}
+    elif network in ("h2", "http"):
+        d["network"] = "h2"
+        opts = {}
+        if host:
+            opts["host"] = [h for h in host.split(",") if h]
+        if path:
+            opts["path"] = path
+        if opts:
+            d["h2-opts"] = opts
+    else:
+        return {}
+    return d
+
+
+def parse_vless(uri: str) -> dict | None:
+    u = urllib.parse.urlsplit(uri)
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    if not u.hostname or not u.port:
+        return None
+    security = q1(qs, "security").lower()
+    network = q1(qs, "type", default="tcp").lower()
+    if network in ("xhttp", "splithttp", "kcp", "quic", "httpupgrade", "meek"):
+        return None
+    d = {
+        "name": clean_name(u.fragment, f"VLESS {u.hostname}:{u.port}"),
+        "type": "vless",
+        "server": u.hostname,
+        "port": int(u.port),
+        "uuid": urllib.parse.unquote(u.username or ""),
+        "udp": True,
+    }
+    if not d["uuid"]:
+        return None
+    if security in ("tls", "reality", "xtls"):
+        d["tls"] = True
+        sni = q1(qs, "sni", "peer")
+        if sni:
+            d["servername"] = sni
+        if security == "reality":
+            pbk = q1(qs, "pbk", "publicKey")
+            sid = q1(qs, "sid", "shortId")
+            if not pbk:
+                return None
+            d["reality-opts"] = {"public-key": pbk}
+            if sid:
+                d["reality-opts"]["short-id"] = sid
+            d["client-fingerprint"] = q1(qs, "fp", "fingerprint", default="chrome")
+        else:
+            if truthy(q1(qs, "allowInsecure", "insecure")):
+                d["skip-cert-verify"] = True
+            fp = q1(qs, "fp")
+            if fp:
+                d["client-fingerprint"] = fp
+            alpn = q1(qs, "alpn")
+            if alpn:
+                d["alpn"] = [a for a in alpn.split(",") if a]
+    flow = q1(qs, "flow")
+    if flow.startswith("xtls-rprx-vision"):
+        d["flow"] = flow
+    d = apply_transport(
+        d, qs, network,
+        host=q1(qs, "host"),
+        path=q1(qs, "path"),
+        service=q1(qs, "serviceName"),
+    )
+    return d or None
+
+
+def parse_vmess(uri: str) -> dict | None:
+    body = uri[len("vmess://"):].split("#", 1)[0].strip()
+    try:
+        js = json.loads(b64_text(body))
+    except Exception:
+        return None
+    if not isinstance(js, dict):
+        return None
+    server, port, uuid = js.get("add"), js.get("port"), js.get("id")
+    if not server or not uuid:
+        return None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    if not (0 < port < 65536):
+        return None
+    d = {
+        "name": clean_name(js.get("ps"), f"VMess {server}:{port}"),
+        "type": "vmess",
+        "server": str(server).strip("[]"),
+        "port": port,
+        "uuid": str(uuid),
+        "alterId": int(js.get("aid") or 0),
+        "cipher": "auto",
+        "udp": True,
+    }
+    if str(js.get("tls", "")).lower() in ("tls", "true", "reality", "1"):
+        d["tls"] = True
+        sni = js.get("sni") or js.get("host") or ""
+        if sni:
+            d["servername"] = sni
+        if truthy(js.get("allowInsecure")):
+            d["skip-cert-verify"] = True
+        if js.get("fp"):
+            d["client-fingerprint"] = str(js["fp"])
+        if js.get("alpn"):
+            d["alpn"] = [a for a in str(js["alpn"]).split(",") if a]
+    net = str(js.get("net") or "tcp").lower()
+    if net in ("xhttp", "kcp", "quic"):
+        return None
+    d = apply_transport(
+        d, {}, net,
+        host=str(js.get("host") or ""),
+        path=str(js.get("path") or ""),
+        service=str(js.get("path") or ""),
+    )
+    return d or None
+
+
+def parse_trojan(uri: str) -> dict | None:
+    u = urllib.parse.urlsplit(uri)
+    if not u.hostname or not u.port:
+        return None
+    password = urllib.parse.unquote(u.username or "")
+    if not password:
+        return None
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    d = {
+        "name": clean_name(u.fragment, f"Trojan {u.hostname}:{u.port}"),
+        "type": "trojan",
+        "server": u.hostname,
+        "port": int(u.port),
+        "password": password,
+        "udp": True,
+    }
+    sni = q1(qs, "sni", "peer", "host")
+    if sni:
+        d["sni"] = sni
+    if truthy(q1(qs, "allowInsecure", "insecure")):
+        d["skip-cert-verify"] = True
+    alpn = q1(qs, "alpn")
+    if alpn:
+        d["alpn"] = [a for a in alpn.split(",") if a]
+    if truthy(q1(qs, "allowInsecure")):
+        d["skip-cert-verify"] = True
+    net = q1(qs, "type", default="tcp")
+    d = apply_transport(
+        d, qs, net,
+        host=q1(qs, "host"),
+        path=q1(qs, "path"),
+        service=q1(qs, "serviceName"),
+    )
+    return d or None
+
+
+def parse_ss(uri: str) -> dict | None:
+    body = uri[len("ss://"):]
+    name_raw = ""
+    if "#" in body:
+        body, name_raw = body.split("#", 1)
+    query = ""
+    if "?" in body:
+        body, query = body.split("?", 1)
+    if "@" in body:
+        userinfo, hostport = body.rsplit("@", 1)
+        if ":" not in userinfo:
+            userinfo = b64_text(userinfo)
+    else:
+        decoded = b64_text(body)
+        if "@" not in decoded:
+            return None
+        userinfo, hostport = decoded.rsplit("@", 1)
+    if ":" not in userinfo:
+        return None
+    method, password = userinfo.split(":", 1)
+    method = method.strip().lower()
+    password = urllib.parse.unquote(password)
+    method = SS_ALIASES.get(method, method)
+    if method not in SS_CIPHERS or not password:
+        return None
+    hp = split_hostport(hostport.split("/", 1)[0])
+    if not hp:
+        return None
+    server, port = hp
+    d = {
+        "name": clean_name(name_raw, f"SS {server}:{port}"),
+        "type": "ss",
+        "server": server,
+        "port": port,
+        "cipher": method,
+        "password": password,
+        "udp": True,
+    }
+    qs = urllib.parse.parse_qs(query, keep_blank_values=True)
+    plugin = q1(qs, "plugin")
+    if plugin:
+        parts = {}
+        for chunk in plugin.split(";"):
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                parts[k.strip()] = v
+            elif chunk.strip():
+                parts["_name"] = chunk.strip()
+        pname = parts.pop("_name", "")
+        if pname in ("obfs-local", "simple-obfs", "obfs"):
+            mode = parts.get("obfs", "http")
+            d["plugin"] = "obfs"
+            d["plugin-opts"] = {"mode": mode}
+            if parts.get("obfs-host"):
+                d["plugin-opts"]["host"] = parts["obfs-host"]
+        elif pname == "v2ray-plugin":
+            d["plugin"] = "v2ray-plugin"
+            d["plugin-opts"] = {
+                "mode": "websocket",
+                "host": parts.get("host", ""),
+                "path": parts.get("path", "/"),
+            }
+            if "tls" in parts:
+                d["plugin-opts"]["tls"] = True
+        else:
+            return None
+    return d
+
+
+def parse_hysteria2(uri: str) -> dict | None:
+    u = urllib.parse.urlsplit(uri)
+    if not u.hostname or not u.port:
+        return None
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    password = urllib.parse.unquote(u.username or "") or q1(qs, "password", "auth")
+    if not password:
+        return None
+    d = {
+        "name": clean_name(u.fragment, f"HY2 {u.hostname}:{u.port}"),
+        "type": "hysteria2",
+        "server": u.hostname,
+        "port": int(u.port),
+        "password": password,
+        "udp": True,
+    }
+    sni = q1(qs, "sni", "peer")
+    if sni:
+        d["sni"] = sni
+    if truthy(q1(qs, "insecure", "allowInsecure")):
+        d["skip-cert-verify"] = True
+    obfs = q1(qs, "obfs")
+    if obfs:
+        d["obfs"] = obfs
+        op = q1(qs, "obfs-password", "obfsPassword")
+        if op:
+            d["obfs-password"] = op
+    alpn = q1(qs, "alpn")
+    if alpn:
+        d["alpn"] = [a for a in alpn.split(",") if a]
+    return d
+
+
+def parse_tuic(uri: str) -> dict | None:
+    u = urllib.parse.urlsplit(uri)
+    if not u.hostname or not u.port:
+        return None
+    uuid = urllib.parse.unquote(u.username or "")
+    password = urllib.parse.unquote(u.password or "")
+    if not uuid:
+        return None
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    d = {
+        "name": clean_name(u.fragment, f"TUIC {u.hostname}:{u.port}"),
+        "type": "tuic",
+        "server": u.hostname,
+        "port": int(u.port),
+        "uuid": uuid,
+        "password": password,
+        "udp": True,
+        "reduce-rtt": True,
+    }
+    sni = q1(qs, "sni", "peer")
+    if sni:
+        d["sni"] = sni
+    alpn = q1(qs, "alpn")
+    if alpn:
+        d["alpn"] = [a for a in alpn.split(",") if a]
+    if truthy(q1(qs, "allow_insecure", "allowInsecure", "insecure")):
+        d["skip-cert-verify"] = True
+    cc = q1(qs, "congestion_control", "congestion-controller")
+    if cc:
+        d["congestion-controller"] = cc
+    mode = q1(qs, "udp_relay_mode", "udp-relay-mode")
+    if mode:
+        d["udp-relay-mode"] = mode
+    return d
+
+
+PARSERS = {
+    "vless": parse_vless,
+    "vmess": parse_vmess,
+    "trojan": parse_trojan,
+    "ss": parse_ss,
+    "hysteria2": parse_hysteria2,
+    "hy2": parse_hysteria2,
+    "tuic": parse_tuic,
+}
+
+
+def parse_uri(uri: str) -> dict | None:
+    uri = uri.strip()
+    if "://" not in uri:
+        return None
+    scheme = uri.split("://", 1)[0].lower()
+    fn = PARSERS.get(scheme)
+    if not fn:
+        return None
+    try:
+        node = fn(uri)
+    except Exception:
+        return None
+    if not node:
+        return None
+    server = str(node.get("server", "")).strip("[]")
+    if not server or server.lower() in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
+        return None
+    if not isinstance(node.get("port"), int) or not (0 < node["port"] < 65536):
+        return None
+    name = node.get("name") or ""
+    if JUNK_NAME.search(name):
+        return None
+    node["server"] = server
+    node["name"] = name
+    return node
+
+
+def node_key(n: dict):
+    auth = n.get("uuid") or n.get("password") or ""
+    net = n.get("network") or "tcp"
+    ws = (n.get("ws-opts") or {}).get("path", "")
+    grpc = (n.get("grpc-opts") or {}).get("grpc-service-name", "")
+    return (n["type"], n["server"].lower(), n["port"], auth, net, ws, grpc)
+
+
+# ---------------------------------------------------------------- sources
+
+def read_sources() -> list[str]:
+    ensure_dirs()
+    out = []
+    for line in SOURCES.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line)
+    return out
+
+
+def source_slug(src: str) -> str:
+    if src.startswith(("http://", "https://")):
+        p = urllib.parse.urlsplit(src)
+        base = Path(p.path).stem or "sub"
+        h = hashlib.sha1(src.encode()).hexdigest()[:6]
+        return re.sub(r"[^a-zA-Z0-9_-]", "", f"{p.hostname}-{base}")[:40] + f"-{h}"
+    p = Path(src).expanduser()
+    h = hashlib.sha1(str(p).encode()).hexdigest()[:6]
+    return re.sub(r"[^a-zA-Z0-9_-]", "", p.stem)[:40] + f"-{h}"
+
+
+def source_label(src: str) -> str:
+    if src.startswith(("http://", "https://")):
+        p = urllib.parse.urlsplit(src)
+        return f"{p.hostname}{p.path}"[:58]
+    return str(Path(src).expanduser())
+
+
+def decode_subscription(raw: bytes) -> str:
+    text = raw.decode("utf-8", "replace").strip()
+    if "://" in text:
+        return text
+    # base64-wrapped whole subscription
+    candidate = b64_text(text)
+    return candidate if "://" in candidate else text
+
+
+def parse_source_text(text: str) -> list[dict]:
+    if re.search(r"^\s*proxies\s*:", text, re.M) or text.lstrip().startswith("proxy-groups"):
+        raise ValueError("Clash/YAML subscription (not supported - use a v2ray/URI subscription)")
+    nodes, seen = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        if "://" not in line:
+            continue
+        node = parse_uri(line)
+        if not node:
+            continue
+        k = node_key(node)
+        if k in seen:
+            continue
+        seen.add(k)
+        nodes.append(node)
+    return nodes
+
+
+def probe(server: str, port: int, timeout: float) -> float | None:
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((server, port), timeout=timeout):
+            return (time.monotonic() - t0) * 1000.0
+    except OSError:
+        return None
+
+
+def preflight(nodes: list[dict], timeout: float = 1.0, workers: int = 200) -> list[tuple[dict, float]]:
+    try:  # many parallel sockets; the macOS default soft limit is low
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(8192, hard), hard))
+    except Exception:
+        pass
+    live: list[tuple[dict, float]] = []
+    total = len(nodes)
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {
+            ex.submit(probe, n["server"], n["port"], timeout): n for n in nodes
+        }
+        for fut in as_completed(futs):
+            node = futs[fut]
+            done += 1
+            ms = fut.result()
+            if ms is not None:
+                live.append((node, ms))
+            if total >= 400 and done % 500 == 0 and TTY:
+                print(dim(f"  probed {done}/{total}..."), end="\r", flush=True)
+    if TTY and total >= 400:
+        print(" " * 32, end="\r", flush=True)
+    return live
+
+
+def write_provider(slug: str, nodes: list[dict]) -> Path:
+    path = PROVIDERS / f"{slug}.yaml"
+    payload = {"proxies": nodes}
+    tmp = path.with_suffix(".yaml.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False))
+    tmp.replace(path)
+    return path
+
+
+def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
+    slugs = [p["slug"] for p in meta.get("providers", []) if p.get("count", 0) > 0]
+    if not slugs:
+        die("no nodes available - run: fvpn -u")
+
+    cfg: dict = {
+        "mixed-port": mixed,
+        "allow-lan": False,
+        "bind-address": "127.0.0.1",
+        "mode": "rule",
+        "log-level": "warning",
+        "ipv6": False,
+        "external-controller": f"127.0.0.1:{ctrl}",
+        "secret": secret(),
+        "unified-delay": True,
+        "tcp-concurrent": True,
+        "find-process-mode": "off",
+        "profile": {"store-selected": True, "store-fake-ip": True},
+        "dns": {
+            "enable": True,
+            "ipv6": False,
+            "listen": "0.0.0.0:1053",
+            "enhanced-mode": "fake-ip",
+            "fake-ip-range": "198.18.0.1/16",
+            "default-nameserver": ["223.5.5.5", "223.6.6.6"],
+            "nameserver": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
+            "proxy-server-nameserver": ["223.5.5.5", "1.1.1.1"],
+        },
+        "proxy-providers": {
+            slug: {
+                "type": "file",
+                "path": str(PROVIDERS / f"{slug}.yaml"),
+                "health-check": {
+                    "enable": True,
+                    "url": HEALTH_URL,
+                    "interval": 300,
+                },
+            }
+            for slug in slugs
+        },
+        "proxy-groups": [
+            {
+                "name": "AUTO",
+                "type": "url-test",
+                "use": slugs,
+                "url": HEALTH_URL,
+                "interval": 300,
+                "tolerance": 50,
+                "lazy": False,
+            },
+            {
+                "name": "PROXY",
+                "type": "select",
+                "proxies": ["AUTO", "DIRECT"],
+                "use": slugs,
+            },
+        ],
+        "rules": [
+            "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+            "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+            "IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
+            "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
+            "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
+            "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+            "MATCH,PROXY",
+        ],
+    }
+    if mode == "tun":
+        cfg["tun"] = {
+            "enable": True,
+            "stack": "gvisor",
+            "auto-route": True,
+            "auto-detect-interface": True,
+            "dns-hijack": ["any:53"],
+            "mtu": 1500,
+        }
+    return cfg
+
+
+def write_config(mode: str, mixed: int, ctrl: int, meta: dict) -> None:
+    cfg = build_config(mode, mixed, ctrl, meta)
+    tmp = CONFIG.with_suffix(".yaml.tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    tmp.replace(CONFIG)
+
+
+# ---------------------------------------------------------------- system proxy
+
+def list_services() -> list[tuple[str, str]]:
+    try:
+        out = subprocess.run(
+            ["networksetup", "-listnetworkserviceorder"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return []
+    services, cur = [], None
+    for line in out.splitlines():
+        m = re.match(r"\(\d+\)\s+(.+)$", line.strip())
+        if m:
+            cur = m.group(1).strip()
+            continue
+        m2 = re.search(r"Device:\s*([^)]+)\)", line)
+        if m2 and cur:
+            services.append((cur, m2.group(1).strip()))
+    return services
+
+
+def active_service() -> str:
+    iface = None
+    try:
+        out = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = re.search(r"interface:\s*(\S+)", out)
+        iface = m.group(1) if m else None
+    except Exception:
+        pass
+    for svc, dev in list_services():
+        if dev and dev == iface:
+            return svc
+    return "Wi-Fi"
+
+
+PROXY_KINDS = [
+    ("web", "-getwebproxy", "-setwebproxy", "-setwebproxystate"),
+    ("secure", "-getsecurewebproxy", "-setsecurewebproxy", "-setsecurewebproxystate"),
+    ("socks", "-getsocksfirewallproxy", "-setsocksfirewallproxy", "-setsocksfirewallproxystate"),
+]
+
+
+def parse_proxy_out(text: str) -> dict:
+    d = {"enabled": False, "server": "", "port": 0}
+    for line in text.splitlines():
+        if line.startswith("Enabled:"):
+            d["enabled"] = line.split(":", 1)[1].strip().lower() == "yes"
+        elif line.startswith("Server:"):
+            d["server"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Port:"):
+            try:
+                d["port"] = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                d["port"] = 0
+    return d
+
+
+def get_bypass(service: str) -> list[str]:
+    res = run_ns("-getproxybypassdomains", service)
+    if res.returncode != 0:
+        return []
+    vals = [x.strip() for x in res.stdout.splitlines() if x.strip()]
+    if vals and vals[0].lower().startswith("there aren't any"):
+        return []
+    return vals
+
+
+def apply_system_proxy(port: int) -> bool:
+    service = active_service()
+    backup = {"service": service, "kinds": {}, "bypass": get_bypass(service)}
+    for kind, getter, setter, stater in PROXY_KINDS:
+        res = run_ns(getter, service)
+        backup["kinds"][kind] = parse_proxy_out(res.stdout) if res.returncode == 0 else {"enabled": False, "server": "", "port": 0}
+    save_json(BACKUP, backup)
+
+    ok = True
+    for kind, getter, setter, stater in PROXY_KINDS:
+        res = run_ns(setter, service, "127.0.0.1", str(port))
+        res2 = run_ns(stater, service, "on")
+        if res.returncode != 0 or res2.returncode != 0:
+            ok = False
+    run_ns("-setproxybypassdomains", service, "localhost", "127.0.0.1", "*.local", "169.254/16")
+    if ok:
+        say(dim(f"  system proxy -> {service} 127.0.0.1:{port}"))
+    return ok
+
+
+def restore_system_proxy() -> None:
+    backup = load_json(BACKUP, None)
+    if not backup:
+        return
+    service = backup.get("service") or "Wi-Fi"
+    for kind, getter, setter, stater in PROXY_KINDS:
+        old = (backup.get("kinds") or {}).get(kind) or {}
+        if old.get("enabled") and old.get("server"):
+            run_ns(setter, service, old["server"], str(old.get("port") or 80))
+            run_ns(stater, service, "on")
+        else:
+            run_ns(stater, service, "off")
+    bypass = backup.get("bypass") or []
+    if bypass:
+        run_ns("-setproxybypassdomains", service, *bypass)
+    else:
+        run_ns("-setproxybypassdomains", service, "Empty")
+    try:
+        BACKUP.unlink()
+    except FileNotFoundError:
+        pass
+    say(dim(f"  system proxy restored on {service}"))
+
+
+# ---------------------------------------------------------------- update
+
+CHECK_ROUNDS = [
+    ("https://www.gstatic.com/generate_204", 4000),
+    ("https://www.wikipedia.org/", 5000),
+    ("https://github.com/", 5000),
+]
+
+
+def _prune_round(by_source: dict[str, list[dict]], url: str,
+                 timeout_ms: int) -> tuple[dict[str, list[dict]], int]:
+    """One real-traffic round: load the pool in a throwaway mihomo, health-check
+    every node against `url`, and keep only nodes that get a response."""
+    tmpdir = DIR / "tmpcheck"
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    slugs = list(by_source)
+    mixed, ctrl = free_port(17890), free_port(19090)
+    fake_meta = {"providers": [{"slug": s, "count": 1} for s in slugs]}
+    cfg = build_config("proxy", mixed, ctrl, fake_meta)
+    cfg["dns"]["listen"] = ""
+    conf = DIR / "check-config.yaml"
+    conf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    logf = open(tmpdir / "mihomo.log", "wb")
+    proc = subprocess.Popen(
+        [mihomo_bin(), "-d", str(DIR), "-f", str(conf), "-ext-ctl", f"127.0.0.1:{ctrl}"],
+        stdout=logf, stderr=logf, start_new_session=True,
+    )
+    try:
+        up = False
+        for _ in range(80):
+            if proc.poll() is not None:
+                break
+            try:
+                api("/version", timeout=1, port=ctrl)
+                up = True
+                break
+            except Exception:
+                time.sleep(0.25)
+        if not up:
+            return by_source, 0
+
+        healthcheck_providers(slugs, port=ctrl, timeout_ms=timeout_ms, url=url)
+        details = provider_details(port=ctrl)
+        kept: dict[str, list[tuple[dict, int]]] = {s: [] for s in slugs}
+        for slug, nodes in by_source.items():
+            for node in nodes:
+                hist = (details.get(node["name"]) or {}).get("history") or []
+                if hist:
+                    ms = int(hist[-1].get("delay") or 0)
+                    if ms > 0:
+                        kept[slug].append((node, ms))
+        total = sum(len(v) for v in kept.values())
+        if total < 5:
+            return by_source, total
+        for bucket in kept.values():
+            bucket.sort(key=lambda x: x[1])
+        return {s: [n for n, _ms in v] for s, v in kept.items()}, total
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        logf.close()
+        try:
+            conf.unlink()
+        except FileNotFoundError:
+            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def prune_pool(by_source: dict[str, list[dict]]) -> tuple[dict[str, list[dict]], int]:
+    """Verify the pool against several real destinations. A node has to work
+    for all of them, which filters out SNI-whitelisting relays that only answer
+    the health-check URL."""
+    current = by_source
+    for i, (url, tmo) in enumerate(CHECK_ROUNDS):
+        host = urllib.parse.urlsplit(url).hostname
+        count = sum(len(v) for v in current.values())
+        print(dim(f"\n  verifying {count} nodes via {host} ... "), end="", flush=True)
+        kept, working = _prune_round(current, url, tmo)
+        if working >= 5:
+            current = kept
+            say(green(f"{working} ok"))
+        else:
+            if i == 0:
+                return by_source, 0
+            say(yellow(f"only {working} ok, stopping here"))
+            break
+    total = sum(len(v) for v in current.values())
+    return current, total
+
+
+def cmd_update(no_test: bool = False) -> int:
+    ensure_dirs()
+    if running():
+        die("disconnect first: fvpn -d")
+    sources = read_sources()
+    if not sources:
+        die(f"no sources configured - edit {SOURCES}")
+
+    say(bold("refreshing nodes"))
+    all_nodes: list[dict] = []
+    seen: set = set()
+    ok_slugs: list[tuple[str, str]] = []
+    failures = 0
+
+    for i, src in enumerate(sources, 1):
+        label = source_label(src)
+        slug = source_slug(src)
+        print(dim(f"  [{i}/{len(sources)}] {label} ... "), end="", flush=True)
+        try:
+            if src.startswith(("http://", "https://")):
+                raw = http_get(src)
+            else:
+                path = Path(src).expanduser()
+                if not path.exists():
+                    raise FileNotFoundError(str(path))
+                raw = path.read_bytes()
+            nodes = parse_source_text(decode_subscription(raw))
+        except Exception as e:
+            failures += 1
+            say(red(f"skip ({str(e)[:60]})"))
+            continue
+        fresh = 0
+        for n in nodes:
+            k = node_key(n)
+            if k in seen:
+                continue
+            seen.add(k)
+            n["_src"] = slug
+            all_nodes.append(n)
+            fresh += 1
+        ok_slugs.append((src, slug))
+        say(f"{len(nodes)} parsed, {fresh} new")
+
+    if not all_nodes:
+        die("no usable nodes found in any source")
+
+    # Even sample if the raw pool is huge, so one giant list can't starve others.
+    if len(all_nodes) > MAX_CANDIDATES:
+        step = len(all_nodes) / MAX_CANDIDATES
+        all_nodes = [all_nodes[int(i * step)] for i in range(MAX_CANDIDATES)]
+        say(dim(f"  sampling {MAX_CANDIDATES} candidates"))
+
+    if no_test:
+        live = [(n, 9999.0) for n in all_nodes]
+        say(dim("  skipping reachability test (--no-test)"))
+    else:
+        print(dim(f"  checking reachability of {len(all_nodes)} nodes ... "), end="", flush=True)
+        live = preflight(all_nodes)
+        say(f"{green(str(len(live)))} reachable")
+
+    if not live:
+        die("every node failed the reachability check - try again later, or add a subscription with: fvpn -i <url>")
+
+    live.sort(key=lambda x: x[1])
+    # 70% purely by latency, the rest spread across sources so one fast list
+    # cannot starve the others (and the pool survives one source going stale).
+    cut = max(1, int(MAX_NODES * 0.7))
+    kept = live[:cut]
+    rest = live[cut:]
+    per_source: dict[str, list] = {}
+    for node, ms in rest:
+        per_source.setdefault(node.get("_src", "_"), []).append((node, ms))
+    while len(kept) < MAX_NODES and per_source:
+        for slug in list(per_source):
+            bucket = per_source[slug]
+            if bucket and len(kept) < MAX_NODES:
+                kept.append(bucket.pop(0))
+            if not bucket:
+                del per_source[slug]
+
+    # group survivors by their origin source, guarantee unique names
+    used_names = set(RESERVED_NAMES)
+    by_source: dict[str, list[dict]] = {}
+    for node, _ms in kept:
+        slug = node.pop("_src", "_")
+        name = node["name"]
+        if name in used_names:
+            base, k = name, 2
+            while f"{base} #{k}" in used_names:
+                k += 1
+            name = f"{base} #{k}"
+        used_names.add(name)
+        node["name"] = name
+        by_source.setdefault(slug, []).append(node)
+
+    # write a first cut so the verifier can load the pool
+    for slug, nodes in by_source.items():
+        write_provider(slug, nodes)
+
+    if not no_test:
+        pruned, working = prune_pool(by_source)
+        if working >= 5:
+            dropped = sum(len(v) for v in by_source.values()) - sum(len(v) for v in pruned.values())
+            by_source = pruned
+            say(dim(f"  {green(str(working))} nodes passed every check {dim(f'({dropped} dead removed)')}"))
+        else:
+            say(yellow("  too few nodes passed, keeping the larger pool"))
+
+    meta = {"updated": time.time(), "candidates": len(all_nodes), "live": len(live), "providers": []}
+    for src, slug in ok_slugs:
+        nodes = by_source.get(slug) or []
+        if not nodes:
+            continue
+        write_provider(slug, nodes)
+        meta["providers"].append({"slug": slug, "source": source_label(src), "count": len(nodes)})
+
+    if not meta["providers"]:
+        die("no live nodes left after filtering")
+
+    # drop providers that no longer exist in sources.conf
+    active = {p["slug"] for p in meta["providers"]}
+    for stale in PROVIDERS.glob("*.yaml"):
+        if stale.stem not in active:
+            stale.unlink()
+    save_json(META, meta)
+
+    write_config("tun", PREF_MIXED_PORT, PREF_CTRL_PORT, meta)
+    check = subprocess.run(
+        [mihomo_bin(), "-t", "-d", str(DIR), "-f", str(CONFIG)],
+        capture_output=True, text=True, timeout=180,
+    )
+    if check.returncode != 0:
+        out = (check.stderr or check.stdout or "").strip()
+        say(dim(out[-1500:]))
+        die("node set produced an invalid config - please report this")
+
+    say("")
+    for p in meta["providers"]:
+        say(f"  {green(str(p['count']).rjust(4))}  {p['source']}")
+    say("")
+    say(f"{green(str(sum(p['count'] for p in meta['providers'])))} nodes ready {dim('(from ' + str(meta['live']) + ' reachable)')}")
+    if failures:
+        say(dim(f"  {failures} source(s) skipped"))
+    say(dim("  connect with: fvpn -c"))
+    return 0
+
+
+# ---------------------------------------------------------------- human output
+
+def node_line(idx: int, delay: float | None, ptype: str, name: str, current: bool = False) -> str:
+    mark = cyan("*") if current else " "
+    d = f"{int(delay)}ms" if delay is not None and delay > 0 else "-"
+    return f" {mark} {idx:>3}  {d:>7}  {ptype:<8} {name}"
+
+
+def current_proxy() -> tuple[str, str]:
+    try:
+        grp = api("/proxies/PROXY")
+        now = grp.get("now") or "-"
+        if now and now != "AUTO":
+            return now, now
+        auto = api("/proxies/AUTO")
+        return "AUTO", auto.get("now") or "-"
+    except Exception:
+        return "-", "-"
+
+
+def delay_of(name: str, proxies: dict | None = None) -> float | None:
+    try:
+        if proxies is None:
+            payload = api("/proxies")
+            proxies = payload.get("proxies") or payload
+        entry = proxies.get(name) or {}
+        hist = entry.get("history") or []
+        if hist:
+            return float(hist[-1].get("delay") or 0)
+    except Exception:
+        pass
+    return None
+
+
+def provider_details(port: int | None = None) -> dict[str, dict]:
+    """name -> proxy object, for nodes supplied by proxy providers."""
+    try:
+        payload = api("/providers/proxies", timeout=20, port=port)
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for prov in (payload.get("providers") or {}).values():
+        for px in prov.get("proxies") or []:
+            name = px.get("name")
+            if name:
+                out[name] = px
+    return out
+
+
+def node_list() -> list[tuple[str, str, float | None]]:
+    payload = api("/proxies", timeout=10)
+    proxies = payload.get("proxies") or payload
+    auto = proxies.get("AUTO") or {}
+    names = list(auto.get("all") or [])
+    if not names:
+        time.sleep(0.4)
+        payload = api("/proxies", timeout=10)
+        proxies = payload.get("proxies") or payload
+        auto = proxies.get("AUTO") or {}
+        names = list(auto.get("all") or [])
+    details = provider_details()
+    rows = []
+    for name in names:
+        e = details.get(name) or proxies.get(name) or {}
+        delay = None
+        hist = e.get("history") or []
+        if hist:
+            delay = float(hist[-1].get("delay") or 0)
+        rows.append((name, e.get("type", "?"), delay))
+    rows.sort(key=lambda r: (r[2] is None, r[2] if r[2] is not None else 1e9))
+    return rows
+
+
+def healthcheck_providers(slugs: list[str], port: int | None = None,
+                          timeout_ms: int = 4000, url: str = HEALTH_URL) -> None:
+    q = urllib.parse.quote(url, safe="")
+    for slug in slugs:
+        path = (f"/providers/proxies/{urllib.parse.quote(slug, safe='')}"
+                f"/healthcheck?url={q}&timeout={timeout_ms}")
+        try:
+            api(path, timeout=180, port=port)
+        except Exception:
+            continue
+
+
+def group_test(timeout_ms: int = 4000) -> dict:
+    q = urllib.parse.quote(HEALTH_URL, safe="")
+    try:
+        return api(f"/group/AUTO/delay?url={q}&timeout={timeout_ms}", timeout=90)
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_connect(proxy_mode: bool) -> int:
+    ensure_dirs()
+    rt = load_json(RUNTIME, None)
+    if running(rt):
+        mode = rt.get("mode", "tun")
+        say(yellow(f"already connected ({mode} mode). Use: fvpn -d"))
+        return 0
+    if BACKUP.exists():
+        # a previous session died mid-flight: put the proxy settings back first
+        restore_system_proxy()
+
+    meta = load_json(META, {})
+    if not meta.get("providers") or not any(p.get("count", 0) > 0 for p in meta["providers"]):
+        say(dim("no nodes cached yet - fetching ..."))
+        if cmd_update() != 0:
+            return 1
+        meta = load_json(META, {})
+
+    mode = "proxy" if proxy_mode else "tun"
+    if mode == "tun" and not ensure_sudo():
+        say(yellow("admin rights unavailable - falling back to system-proxy mode"))
+        mode = "proxy"
+
+    mixed = free_port(PREF_MIXED_PORT)
+    ctrl = free_port(PREF_CTRL_PORT)
+    write_config(mode, mixed, ctrl, meta)
+
+    # validate before launching
+    check = subprocess.run(
+        [mihomo_bin(), "-t", "-d", str(DIR), "-f", str(CONFIG)],
+        capture_output=True, text=True, timeout=120,
+    )
+    if check.returncode != 0:
+        say(check.stderr.strip()[-1200:] or check.stdout.strip()[-1200:])
+        die("generated config is invalid")
+
+    log_start = LOG.stat().st_size if LOG.exists() else 0
+    logf = open(LOG, "ab")
+    logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} connect mode={mode} =====\n".encode())
+    logf.flush()
+
+    if mode == "tun":
+        try:
+            PIDFILE.unlink()
+        except FileNotFoundError:
+            pass
+        cmd = [
+            "sudo", "sh", "-c",
+            'echo $$ > "$1"; exec "$2" -d "$3" -f "$4" -ext-ctl "127.0.0.1:$5"',
+            "sh", str(PIDFILE), mihomo_bin(), str(DIR), str(CONFIG), str(ctrl),
+        ]
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
+        pid = 0
+        for _ in range(50):
+            if PIDFILE.exists():
+                try:
+                    pid = int(PIDFILE.read_text().strip())
+                except ValueError:
+                    pid = 0
+                if pid:
+                    break
+            time.sleep(0.1)
+        if not pid:
+            proc.terminate()
+            say(tail_log())
+            die("could not start the tunnel (admin rights?)")
+    else:
+        proc = subprocess.Popen(
+            [mihomo_bin(), "-d", str(DIR), "-f", str(CONFIG),
+             "-ext-ctl", f"127.0.0.1:{ctrl}"],
+            stdout=logf, stderr=logf, start_new_session=True,
+        )
+        pid = proc.pid
+        PIDFILE.write_text(str(pid))
+
+    rt = {
+        "pid": pid,
+        "mode": mode,
+        "mixed": mixed,
+        "ctrl": ctrl,
+        "started": time.time(),
+        "log": str(LOG),
+        "config": str(CONFIG),
+    }
+    save_json(RUNTIME, rt)
+
+    # wait for the API
+    up = False
+    for _ in range(80):
+        if not pid_alive(pid):
+            break
+        if api_ok():
+            up = True
+            break
+        time.sleep(0.25)
+    if not up:
+        say(tail_log())
+        cmd_disconnect(quiet=True)
+        die("backend failed to start - try 'fvpn -c --proxy', or see: fvpn logs")
+
+    if mode == "proxy":
+        if not apply_system_proxy(mixed):
+            say(yellow("  could not change the system proxy - point apps at 127.0.0.1:%d" % mixed))
+
+    # Ask the url-test group for a quick batch so the first connection lands
+    # on a node that already answered a real request.
+    print(dim("selecting best node ..."), end="", flush=True)
+    group_test(3000)
+    print(" " * 30, end="\r", flush=True)
+
+    err = error_lines(log_start)
+    if err:
+        say(yellow("backend reported errors:"))
+        for line in err[-3:]:
+            say(dim("  " + line[-150:]))
+
+    say(green("connected") + dim(f"  ({mode} mode)"))
+    print_status()
+    return 0
+
+
+def error_lines(since: int = 0) -> list[str]:
+    try:
+        data = LOG.read_bytes()[since:].decode("utf-8", "replace")
+    except Exception:
+        return []
+    return [l for l in data.splitlines() if "level=error" in l or "operation not permitted" in l]
+
+
+def tail_log(n: int = 12) -> str:
+    try:
+        lines = LOG.read_text(errors="replace").splitlines()
+    except Exception:
+        return ""
+    return "\n".join(dim("  " + l[-200:]) for l in lines[-n:])
+
+
+def safe_kill(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+        return
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        pass
+    flag = f"-{int(sig)}"
+    if subprocess.run(["sudo", "-n", "kill", flag, str(pid)],
+                      capture_output=True).returncode == 0:
+        return
+    if ensure_sudo():
+        subprocess.run(["sudo", "kill", flag, str(pid)], capture_output=True)
+
+
+def cmd_disconnect(quiet: bool = False) -> int:
+    rt = load_json(RUNTIME, None)
+
+    # always restore the system proxy, even after a crash
+    if BACKUP.exists():
+        restore_system_proxy()
+
+    pids: list[int] = []
+    if rt and rt.get("pid"):
+        pids.append(int(rt["pid"]))
+    for p in find_mihomo_pids():
+        if p not in pids:
+            pids.append(p)
+
+    mode = (rt or {}).get("mode", "tun")
+    alive = [p for p in pids if pid_alive(p)]
+    if not alive:
+        if not quiet:
+            say(yellow("not connected"))
+        for f in (RUNTIME, PIDFILE):
+            try:
+                f.unlink()
+            except FileNotFoundError:
+                pass
+        return 0
+
+    for pid in alive:
+        safe_kill(pid, signal.SIGTERM)
+
+    for _ in range(30):
+        if not any(pid_alive(p) for p in alive):
+            break
+        time.sleep(0.2)
+    for pid in alive:
+        if pid_alive(pid):
+            safe_kill(pid, signal.SIGKILL)
+
+    if mode == "tun" or os.geteuid() == 0:
+        # root-owned cache.db would break the next non-root run
+        chown = ["chown", "-R", f"{os.getuid()}:{os.getgid()}", str(DIR)]
+        if subprocess.run(["sudo", "-n", *chown], capture_output=True).returncode != 0:
+            if os.geteuid() == 0:
+                subprocess.run(chown, capture_output=True)
+            elif ensure_sudo():
+                subprocess.run(["sudo", *chown], capture_output=True)
+
+    for f in (RUNTIME, PIDFILE):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+
+    if not quiet:
+        say(green("disconnected"))
+    return 0
+
+
+def print_status() -> None:
+    rt = load_json(RUNTIME, None)
+    if not rt or not running(rt):
+        meta = load_json(META, {})
+        total = sum(p.get("count", 0) for p in meta.get("providers", []))
+        say(yellow("not connected"))
+        if total:
+            say(dim(f"  {total} nodes cached, updated {time.strftime('%Y-%m-%d %H:%M', time.localtime(meta.get('updated', 0)))}"))
+        say(dim("  start with: fvpn -c"))
+        return
+
+    mode = rt.get("mode", "?")
+    mode_txt = "TUN (all traffic)" if mode == "tun" else "system proxy"
+    uptime = human_uptime(time.time() - float(rt.get("started", time.time())))
+    group, node = current_proxy()
+    delay = delay_of(node) if node not in ("-", "AUTO") else None
+
+    say(bold("fvpn status"))
+    say(f"  state    {green('connected')}  {dim(uptime)}")
+    say(f"  mode     {mode_txt}")
+    if node and node != "-":
+        d = f" ({int(delay)} ms)" if delay else ""
+        label = f"{node}{d}" if group != "AUTO" else f"{node}{d}  {dim('[auto]')}"
+        say(f"  node     {label}")
+    say(f"  proxy    127.0.0.1:{rt.get('mixed')}  {dim('(http + socks5)')}")
+    try:
+        conn = api("/connections", timeout=2)
+        down = float(conn.get("downloadTotal") or 0)
+        up = float(conn.get("uploadTotal") or 0)
+        say(f"  traffic  {dim('down')} {human_bytes(down)}  {dim('up')} {human_bytes(up)}")
+    except Exception:
+        pass
+    say(dim(f"  log      {rt.get('log')}"))
+
+
+def cmd_list(show_all: bool = False) -> int:
+    if not (running() and api_ok()):
+        meta = load_json(META, {})
+        if not meta.get("providers"):
+            say(dim("no nodes cached - run: fvpn -u"))
+            return 0
+        say(bold("cached providers"))
+        for p in meta["providers"]:
+            say(f"  {p.get('count', 0):>4}  {p.get('source', p.get('slug'))}")
+        say(dim("  connect to see live latency: fvpn -c"))
+        return 0
+
+    rows = node_list()
+    if not rows:
+        say(yellow("no nodes in the AUTO group yet - try: fvpn -t"))
+        return 0
+
+    _g, now = current_proxy()
+    say(bold(f"nodes ({len(rows)})"))
+    say(dim("   #    delay  type     name"))
+    limit = len(rows) if show_all else min(len(rows), 25)
+    for i, (name, ptype, delay) in enumerate(rows[:limit], 1):
+        say(node_line(i, delay, ptype, name, current=(name == now)))
+    if limit < len(rows):
+        say(dim(f"  ... {len(rows) - limit} more (fvpn -l --all)"))
+    say(dim("  pin one: fvpn -p <#>   auto: fvpn -a"))
+    return 0
+
+
+def cmd_test() -> int:
+    if not (running() and api_ok()):
+        die("not connected - start with: fvpn -c")
+    meta = load_json(META, {})
+    slugs = [p["slug"] for p in meta.get("providers", [])]
+    if not slugs:
+        die("no nodes in the pool - run: fvpn -u")
+    total = sum(p.get("count", 0) for p in meta.get("providers", []))
+    say(dim(f"testing {total} nodes ..."))
+    healthcheck_providers(slugs, timeout_ms=4000)
+    rows = node_list()
+    good = sorted((d, n) for n, _t, d in rows if d and d > 0)
+    if not good:
+        say(yellow("no node passed the test - refresh the pool with: fvpn -u"))
+        return 1
+    group_test(3000)  # let the auto group pick the winner
+    _g, now = current_proxy()
+    say(bold(f"working nodes ({len(good)}/{len(rows)})"))
+    for i, (ms, name) in enumerate(good[:20], 1):
+        say(node_line(i, ms, "", name, current=(name == now)))
+    say(dim(f"  best: {good[0][1]} ({good[0][0]} ms)"))
+    say(dim("  pin it: fvpn -p 1"))
+    return 0
+
+
+def resolve_node(arg: str) -> str | None:
+    rows = node_list()
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(rows):
+            return rows[idx][0]
+        return None
+    if arg.upper() in ("AUTO", "DIRECT"):
+        return arg.upper()
+    for name, _t, _d in rows:
+        if name == arg:
+            return name
+    matches = [n for n, _t, _d in rows if arg.lower() in n.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def cmd_use(arg: str) -> int:
+    if not (running() and api_ok()):
+        die("not connected - start with: fvpn -c")
+    name = resolve_node(arg)
+    if not name:
+        die(f"no unique node matching '{arg}' - see: fvpn -l")
+    try:
+        api("/proxies/PROXY", "PUT", {"name": name})
+    except urllib.error.HTTPError as e:
+        die(f"switch failed ({e.code}) - is '{name}' in the list?")
+    except Exception as e:
+        die(f"switch failed: {e}")
+    say(green("node pinned: ") + name)
+    return 0
+
+
+def cmd_auto() -> int:
+    if not (running() and api_ok()):
+        die("not connected - start with: fvpn -c")
+    try:
+        api("/proxies/PROXY", "PUT", {"name": "AUTO"})
+    except Exception as e:
+        die(f"could not switch to auto: {e}")
+    say(dim("re-testing nodes ..."))
+    group_test(3000)
+    _g, now = current_proxy()
+    if now and now not in ("-", "AUTO"):
+        d = delay_of(now)
+        say(green("auto mode: ") + (f"{now} ({int(d)} ms)" if d else now))
+    else:
+        say(green("auto mode: ") + "mihomo will pick the fastest node on first use")
+    return 0
+
+
+def cmd_add(src: str) -> int:
+    ensure_dirs()
+    src = src.strip()
+    if not src.startswith(("http://", "https://")):
+        if not Path(src).expanduser().exists():
+            die(f"not a URL or existing file: {src}")
+        src = str(Path(src).expanduser().resolve())
+    lines = SOURCES.read_text().splitlines()
+    if src in lines:
+        say("already configured")
+        return 0
+    lines.insert(0, src)
+    SOURCES.write_text("\n".join(lines) + "\n")
+    say(green("added: ") + source_label(src))
+    say(dim("  refresh nodes with: fvpn -u"))
+    return 0
+
+
+def cmd_logs(follow: bool = False) -> int:
+    if not LOG.exists():
+        say(dim("no log yet"))
+        return 0
+    args = ["tail", "-n", "80"] + (["-f"] if follow else []) + [str(LOG)]
+    return subprocess.run(args).returncode
+
+
+# ---------------------------------------------------------------- help
+
+HELP = f"""
+{bold('fvpn')} {dim('v' + VERSION)} - free VPN client for macOS {dim('(mihomo backend)')}
+
+{cyan('connect')}
+  fvpn -c                connect, TUN mode (every app, asks for admin once)
+  fvpn -c --proxy        connect via macOS system proxy (no root)
+  fvpn -d                disconnect and restore network settings
+
+{cyan('use')}
+  fvpn -s                status, current node, latency, traffic
+  fvpn -l                list nodes, fastest first
+  fvpn -l --all          list every node
+  fvpn -t                re-test all nodes and pick the fastest
+  fvpn -p 3              pin node #3 (number from 'fvpn -l')
+  fvpn -p japan          pin the node whose name matches 'japan'
+  fvpn -a                back to automatic fastest-node selection
+
+{cyan('nodes')}
+  fvpn -u                rebuild + verify the pool (disconnect first, ~2 min)
+  fvpn -u --no-test      skip verification (faster, but nodes may be dead)
+  fvpn -i <url|file>     add your own subscription, then: fvpn -u
+
+{cyan('other')}
+  fvpn logs [-f]         show / follow the backend log
+  fvpn -h                this help
+
+{cyan('files')}
+  {SOURCES}
+  {CONFIG}
+  {LOG}
+
+{dim('Free public nodes are run by strangers: assume they can see your traffic.')} 
+{dim('Use them for casual browsing, not banking or work logins.')}
+"""
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    if not args:
+        print(HELP)
+        return 0
+
+    flags = {a for a in args if a.startswith("--")}
+    words = [a for a in args if not a.startswith("-")]
+    first = words[0] if words else ""
+
+    cmd_map = {
+        "-c": "connect", "connect": "connect", "--connect": "connect",
+        "-d": "disconnect", "disconnect": "disconnect", "--disconnect": "disconnect",
+        "-s": "status", "status": "status", "--status": "status",
+        "-l": "list", "list": "list", "--list": "list",
+        "-t": "test", "test": "test", "--test": "test",
+        "-u": "update", "update": "update", "--update": "update",
+        "-i": "add", "add": "add", "--add": "add",
+        "-p": "use", "use": "use", "--use": "use",
+        "-a": "auto", "auto": "auto", "--auto": "auto",
+        "logs": "logs", "log": "logs",
+        "-h": "help", "--help": "help", "help": "help",
+        "-v": "version", "--version": "version", "version": "version",
+    }
+    cmd = cmd_map.get(args[0], cmd_map.get(first))
+    if not cmd:
+        say(red(f"unknown command: {args[0]}"))
+        print(HELP)
+        return 2
+
+    if cmd == "help":
+        print(HELP)
+        return 0
+    if cmd == "version":
+        say(f"{APP} {VERSION} | backend: {mihomo_bin() if shutil.which('mihomo') or Path('/opt/homebrew/bin/mihomo').exists() else 'missing'}")
+        return 0
+    if cmd == "connect":
+        return cmd_connect(proxy_mode="--proxy" in flags)
+    if cmd == "disconnect":
+        return cmd_disconnect()
+    if cmd == "status":
+        print_status()
+        return 0
+    if cmd == "list":
+        return cmd_list(show_all="--all" in flags)
+    if cmd == "test":
+        return cmd_test()
+    if cmd == "update":
+        return cmd_update(no_test="--no-test" in flags)
+    if cmd == "add":
+        rest = [a for a in args[1:] if not a.startswith("-")]
+        src = rest[0] if rest else os.environ.get("FVPN_SUB", "")
+        if not src:
+            die("usage: fvpn -i <subscription-url|file>")
+        return cmd_add(src)
+    if cmd == "use":
+        rest = [a for a in args[1:] if not a.startswith("-")]
+        if not rest:
+            die("usage: fvpn -p <#>|name")
+        return cmd_use(rest[0])
+    if cmd == "auto":
+        return cmd_auto()
+    if cmd == "logs":
+        return cmd_logs(follow="-f" in args or "--follow" in args)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        say("\ninterrupted")
+        sys.exit(130)
