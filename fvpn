@@ -49,7 +49,26 @@ if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
 else:
     HOME = Path.home()
 
-DIR = Path(os.environ.get("FVPN_HOME", HOME / ".fvpn"))
+
+def _data_dir() -> Path:
+    """Prefer ~/.fvpn. If a previous root run left it unwritable, fall back to
+    Application Support instead of failing (no sudo needed to recover)."""
+    env = os.environ.get("FVPN_HOME")
+    if env:
+        return Path(env).expanduser()
+    primary = HOME / ".fvpn"
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        if os.access(primary, os.W_OK | os.X_OK):
+            return primary
+    except OSError:
+        pass
+    return HOME / "Library" / "Application Support" / "fvpn"
+
+
+DIR = _data_dir()
+FALLBACK_HOME = DIR != (HOME / ".fvpn") and not os.environ.get("FVPN_HOME")
+_WARNED = False
 SOURCES = DIR / "sources.conf"
 META = DIR / "meta.json"
 RUNTIME = DIR / "runtime.json"
@@ -57,6 +76,7 @@ CONFIG = DIR / "config.yaml"
 SECRET_FILE = DIR / "secret"
 PROVIDERS = DIR / "providers"
 BACKUP = DIR / "proxy_backup.json"
+GEO = DIR / "geo.json"
 LOG_DIR = DIR / "logs"
 LOG = LOG_DIR / "mihomo.log"
 PIDFILE = DIR / "mihomo.pid"
@@ -142,6 +162,24 @@ def say(msg: str = "") -> None:
     print(msg, flush=True)
 
 
+def note(msg: str) -> None:
+    """Diagnostics go to stderr so they never pollute parsed output."""
+    print(dim(msg), file=sys.stderr, flush=True)
+
+
+def normalize_terminal() -> None:
+    """A TUI (agy) can exit with the tty in raw mode; then newlines no longer
+    return to column 0 and every line is indented further than the last."""
+    if not sys.stdout.isatty():
+        return
+    try:
+        out = subprocess.run(["stty", "-a"], capture_output=True, text=True, timeout=2).stdout
+        if "-onlcr" in out or "-opost" in out:
+            subprocess.run(["stty", "opost", "onlcr"], capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+
 def die(msg: str, code: int = 1) -> "NoReturn":
     say(red(f"fvpn: {msg}"))
     sys.exit(code)
@@ -169,10 +207,24 @@ def human_uptime(seconds: float) -> str:
 # ---------------------------------------------------------------- fs helpers
 
 def ensure_dirs() -> None:
+    global _WARNED
     DIR.mkdir(parents=True, exist_ok=True)
     PROVIDERS.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(DIR, 0o700)
+    try:
+        os.chmod(DIR, 0o700)
+    except OSError:
+        pass
+    if FALLBACK_HOME and not _WARNED:
+        _WARNED = True
+        marker = DIR / ".root-dir-notice"
+        if not marker.exists():
+            note(f"using {DIR} (~/.fvpn is root-owned)")
+            note("fix once with: sudo chown -R $(id -u):$(id -g) ~/.fvpn")
+            try:
+                marker.write_text("1")
+            except OSError:
+                pass
     if not SOURCES.exists():
         SOURCES.write_text(
             "# fvpn sources - one subscription URL or local file per line.\n"
@@ -300,6 +352,13 @@ def find_mihomo_pids() -> list[int]:
         return [int(x) for x in out.split() if x.isdigit()]
     except Exception:
         return []
+
+
+def heal_stale_proxy() -> None:
+    """macOS keeps proxy settings across reboots. If they point at a mihomo
+    that is no longer running, put the previous settings back."""
+    if BACKUP.exists() and not running():
+        restore_system_proxy()
 
 
 def ensure_sudo() -> bool:
@@ -843,7 +902,7 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
         "bind-address": "127.0.0.1",
         "mode": "rule",
         "log-level": "warning",
-        "ipv6": False,
+        "ipv6": True,
         "external-controller": f"127.0.0.1:{ctrl}",
         "secret": secret(),
         "unified-delay": True,
@@ -898,6 +957,11 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
             "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
             "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
             "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+        ] + ([] if os.environ.get("FVPN_IPV6") else [
+            # fail closed: IPv6 must not slip past the tunnel and reveal the
+            # real location to geo-blocked APIs
+            "IP-CIDR6,::/0,REJECT",
+        ]) + [
             "MATCH,PROXY",
         ],
     }
@@ -1369,6 +1433,107 @@ def group_test(timeout_ms: int = 4000) -> dict:
         return {}
 
 
+# ---------------------------------------------------------------- geo
+
+def geo_lookup(port: int, timeout: int = 7) -> dict | None:
+    """Exit IP / country as seen from outside, through the local proxy."""
+    for url in ("https://ipinfo.io/json", "https://ipapi.co/json/"):
+        try:
+            res = subprocess.run(
+                ["curl", "-sS", "--max-time", str(timeout),
+                 "--proxy", f"http://127.0.0.1:{port}", url],
+                capture_output=True, text=True, timeout=timeout + 3,
+            )
+            js = json.loads(res.stdout)
+            cc = (js.get("country") or js.get("country_code") or "").upper()
+            if cc:
+                return {
+                    "country": cc,
+                    "ip": js.get("ip") or "",
+                    "org": js.get("org") or js.get("asn") or "",
+                }
+        except Exception:
+            continue
+    return None
+
+
+def geo_cache() -> dict:
+    return load_json(GEO, {})
+
+
+def save_geo(cache: dict) -> None:
+    save_json(GEO, cache)
+
+
+def cmd_geo(want: str | None = None) -> int:
+    if not (running() and api_ok()):
+        die("not connected - start with: fvpn -c")
+
+    mixed = int(load_json(RUNTIME, {}).get("mixed", PREF_MIXED_PORT))
+    _grp, node = current_proxy()
+
+    if not want:
+        info = geo_lookup(mixed)
+        say(bold("exit"))
+        say(f"  node     {node}")
+        if info:
+            say(f"  country  {info['country']}  {dim(info.get('org', '')[:48])}")
+            say(f"  ip       {info['ip']}")
+            if info["country"] in ("IR", "CN", "RU", "KP", "SY", "CU"):
+                say(dim("  this exit is in a country many AI APIs block"))
+        else:
+            say(yellow("  could not determine the exit location"))
+        return 0
+
+    want = want.upper()
+    rows = node_list()
+    if not rows:
+        die("no nodes in the pool - run: fvpn -u")
+
+    cache = geo_cache()
+    now = time.time()
+    tried = 0
+    found = None
+    available: dict[str, str] = {}
+
+    for name, _ptype, _delay in rows:
+        entry = cache.get(name) or {}
+        cc = entry.get("country")
+        if not cc or now - float(entry.get("ts", 0)) > 21600:
+            if tried >= 30:
+                break
+            tried += 1
+            try:
+                api("/proxies/PROXY", "PUT", {"name": name})
+            except Exception:
+                continue
+            time.sleep(0.2)
+            info = geo_lookup(mixed, timeout=6)
+            if not info:
+                continue
+            cc = info["country"]
+            cache[name] = {**info, "ts": now}
+            save_geo(cache)
+        available[cc] = name
+        if cc == want and not found:
+            found = name
+            break
+
+    if not found:
+        say(yellow(f"no node exits in {want}"))
+        if available:
+            say("seen so far: " + ", ".join(sorted(available)))
+        say(dim(f"  scanned {tried} nodes; try again or use: fvpn -l and -p <#>"))
+        return 1
+
+    api("/proxies/PROXY", "PUT", {"name": found})
+    info = cache.get(found, {})
+    say(green(f"pinned {found}"))
+    say(f"  exit     {info.get('country', want)}  {dim(info.get('org', ''))}")
+    say(f"  ip       {info.get('ip', '?')}")
+    return 0
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_connect(proxy_mode: bool) -> int:
@@ -1764,6 +1929,8 @@ HELP = f"""
   fvpn -p 3              pin node #3 (number from 'fvpn -l')
   fvpn -p japan          pin the node whose name matches 'japan'
   fvpn -a                back to automatic fastest-node selection
+  fvpn -g                show the exit IP and country
+  fvpn -g SG             switch to the fastest node exiting in SG
 
 {cyan('nodes')}
   fvpn -u                rebuild + verify the pool (disconnect first, ~2 min)
@@ -1785,6 +1952,7 @@ HELP = f"""
 
 
 def main(argv: list[str]) -> int:
+    normalize_terminal()
     args = argv[1:]
     if not args:
         print(HELP)
@@ -1804,6 +1972,7 @@ def main(argv: list[str]) -> int:
         "-i": "add", "add": "add", "--add": "add",
         "-p": "use", "use": "use", "--use": "use",
         "-a": "auto", "auto": "auto", "--auto": "auto",
+        "-g": "geo", "geo": "geo", "--geo": "geo",
         "logs": "logs", "log": "logs",
         "-h": "help", "--help": "help", "help": "help",
         "-v": "version", "--version": "version", "version": "version",
@@ -1813,6 +1982,9 @@ def main(argv: list[str]) -> int:
         say(red(f"unknown command: {args[0]}"))
         print(HELP)
         return 2
+
+    if cmd not in ("connect", "disconnect"):
+        heal_stale_proxy()
 
     if cmd == "help":
         print(HELP)
@@ -1846,6 +2018,9 @@ def main(argv: list[str]) -> int:
         return cmd_use(rest[0])
     if cmd == "auto":
         return cmd_auto()
+    if cmd == "geo":
+        rest = [a for a in args[1:] if not a.startswith("-")]
+        return cmd_geo(rest[0] if rest else None)
     if cmd == "logs":
         return cmd_logs(follow="-f" in args or "--follow" in args)
     return 2
