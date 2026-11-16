@@ -44,7 +44,7 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- platform & constants
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP = "fvpn"
 
 IS_MACOS = sys.platform == "darwin"
@@ -127,6 +127,42 @@ PREF_MIXED_PORT = int(os.environ.get("FVPN_PORT", "7890"))
 PREF_CTRL_PORT = int(os.environ.get("FVPN_CTRL_PORT", "9090"))
 HEALTH_URL = "https://www.gstatic.com/generate_204"
 USER_AGENT = f"{APP}/{VERSION}"
+
+# Countries where Google AI / Gemini API is blocked or restricted:
+# Connecting through these triggers "User location is not supported for the API use".
+BLOCKED_AI_COUNTRIES = {
+    "CN", "HK", "IR", "RU", "MM", "KP", "SY", "CU", "BY", "MO"
+}
+
+# Preferred countries supporting Google AI with good latency from Asia/Global:
+PREFERRED_AI_COUNTRIES = {
+    "SG", "JP", "TW", "KR", "TH", "MY", "US", "DE", "GB", "NL", "FR", "CA", "AU"
+}
+
+
+def emoji_to_cc(s: str) -> str | None:
+    for i in range(len(s) - 1):
+        c1, c2 = ord(s[i]), ord(s[i + 1])
+        if 0x1F1E6 <= c1 <= 0x1F1FF and 0x1F1E6 <= c2 <= 0x1F1FF:
+            return chr(c1 - 0x1F1E6 + ord("A")) + chr(c2 - 0x1F1E6 + ord("A"))
+    return None
+
+
+CC_PAT = re.compile(
+    r"\b(US|SG|JP|TW|KR|TH|MY|ID|IN|DE|GB|UK|FR|CA|AU|NL|SE|ES|IT|RO|RU|HK|CN|IR|MM|VN|PH|AE|AT|CH|MX|BR|CL|ZA|EE|PL|FI|UA)\b",
+    re.I,
+)
+
+
+def detect_country(name: str) -> str | None:
+    cc = emoji_to_cc(name)
+    if cc:
+        return cc.upper()
+    m = CC_PAT.search(name)
+    if m:
+        c = m.group(1).upper()
+        return "GB" if c == "UK" else c
+    return None
 
 # Public lists that answered healthy when this tool was written. Dead ones are
 # skipped automatically, so the list can safely go stale.
@@ -271,6 +307,47 @@ def ensure_dirs() -> None:
             "# Add your own with: fvpn -i <url>\n"
             + "\n".join(DEFAULT_SOURCES) + "\n"
         )
+    if IS_LINUX and DIR != (Path.home() / ".fvpn") and not (Path.home() / ".fvpn").exists():
+        try:
+            (Path.home() / ".fvpn").symlink_to(DIR)
+        except Exception:
+            pass
+    filter_provider_nodes()
+
+
+def filter_provider_nodes() -> int:
+    """Filter out cached nodes from regions known to block Google AI (CN, HK, IR, RU, MM, etc.)."""
+    removed = 0
+    updated_counts: dict[str, int] = {}
+    for f in PROVIDERS.glob("*.yaml"):
+        try:
+            data = json.loads(f.read_text())
+            proxies = data.get("proxies", [])
+            kept = []
+            for px in proxies:
+                cc = detect_country(px.get("name", ""))
+                if cc and cc in BLOCKED_AI_COUNTRIES:
+                    removed += 1
+                else:
+                    kept.append(px)
+            if len(kept) != len(proxies):
+                data["proxies"] = kept
+                f.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+            updated_counts[f.stem] = len(kept)
+        except Exception:
+            pass
+    if removed > 0 and META.exists():
+        try:
+            meta = load_json(META, {})
+            if "providers" in meta:
+                for p in meta["providers"]:
+                    slug = p.get("slug")
+                    if slug in updated_counts:
+                        p["count"] = updated_counts[slug]
+                save_json(META, meta)
+        except Exception:
+            pass
+    return removed
 
 
 def chown_to_user() -> None:
@@ -545,9 +622,14 @@ def find_mihomo_pids() -> list[int]:
 def heal_stale_proxy() -> None:
     """If proxy settings or environment profile are left behind from a crashed or
     stopped mihomo, restore clean network settings."""
-    has_stale = BACKUP.exists() or (IS_LINUX and ETC_PROFILE_PROXY.exists())
+    has_stale = (
+        BACKUP.exists()
+        or (IS_LINUX and ETC_PROFILE_PROXY.exists())
+        or (IS_WSL and (DIR / "resolv.conf.bak").exists())
+    )
     if has_stale and not running():
         restore_system_proxy()
+        restore_wsl_dns()
 
 
 def ensure_sudo() -> bool:
@@ -590,6 +672,57 @@ def ensure_ip_forward() -> None:
         subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], capture_output=True)
     elif ensure_sudo():
         subprocess.run(["sudo", "-n", "sysctl", "-w", "net.ipv4.ip_forward=1"], capture_output=True)
+
+
+def setup_wsl_dns() -> None:
+    """In WSL2, configure /etc/resolv.conf to query 1.1.1.1 and 8.8.8.8 so DNS
+    queries enter the TUN adapter and are intercepted by Fake-IP instead of
+    leaking directly to the local Windows host ISP."""
+    if not IS_WSL:
+        return
+    resolv = Path("/etc/resolv.conf")
+    if not resolv.exists():
+        return
+    backup = DIR / "resolv.conf.bak"
+    try:
+        current_text = resolv.read_text(errors="replace")
+        if "1.1.1.1" in current_text and "8.8.8.8" in current_text:
+            return
+        if not backup.exists():
+            backup.write_text(current_text)
+        new_content = "# Generated by fvpn for WSL TUN mode\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+        if os.geteuid() == 0:
+            resolv.write_text(new_content)
+        else:
+            subprocess.run(
+                ["sudo", "-n", "sh", "-c", f"cat > {resolv}"],
+                input=new_content, text=True, capture_output=True,
+            )
+        say(dim("  WSL DNS updated -> 1.1.1.1, 8.8.8.8 (routed through TUN)"))
+    except Exception:
+        pass
+
+
+def restore_wsl_dns() -> None:
+    """Restore original /etc/resolv.conf in WSL2 when disconnecting."""
+    if not IS_WSL:
+        return
+    backup = DIR / "resolv.conf.bak"
+    resolv = Path("/etc/resolv.conf")
+    if backup.exists():
+        try:
+            content = backup.read_text(errors="replace")
+            if os.geteuid() == 0:
+                resolv.write_text(content)
+            else:
+                subprocess.run(
+                    ["sudo", "-n", "sh", "-c", f"cat > {resolv}"],
+                    input=content, text=True, capture_output=True,
+                )
+            backup.unlink()
+            say(dim("  WSL DNS restored"))
+        except Exception:
+            pass
 
 
 def get_default_interface() -> str | None:
@@ -1176,16 +1309,23 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
 
     cfg: dict = {
         "mixed-port": mixed,
-        "allow-lan": False,
-        "bind-address": "127.0.0.1",
+        "allow-lan": True,
+        "bind-address": "*",
         "mode": "rule",
         "log-level": "warning",
-        "ipv6": True,
+        "ipv6": bool(os.environ.get("FVPN_IPV6")),
         "external-controller": f"127.0.0.1:{ctrl}",
         "secret": secret(),
         "unified-delay": True,
         "tcp-concurrent": True,
         "find-process-mode": "off",
+        "sniffer": {
+            "enable": True,
+            "sniff": {
+                "TLS": {"ports": [443, 8443]},
+                "HTTP": {"ports": [80, 8080]},
+            },
+        },
         "profile": {"store-selected": True, "store-fake-ip": True},
         "dns": {
             "enable": True,
@@ -1193,14 +1333,14 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
             "listen": "0.0.0.0:1053",
             "enhanced-mode": "fake-ip",
             "fake-ip-range": "198.18.0.1/16",
-            "default-nameserver": ["1.1.1.1", "8.8.8.8", "223.5.5.5", "223.6.6.6"],
+            "default-nameserver": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
             "nameserver": [
                 "https://1.1.1.1/dns-query",
                 "https://8.8.8.8/dns-query",
                 "1.1.1.1",
                 "8.8.8.8",
             ],
-            "proxy-server-nameserver": ["1.1.1.1", "8.8.8.8", "223.5.5.5"],
+            "proxy-server-nameserver": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
         },
         "proxy-providers": {
             slug: {
@@ -1680,6 +1820,9 @@ def cmd_update(no_test: bool = False) -> int:
             if k in seen:
                 continue
             seen.add(k)
+            cc = detect_country(n.get("name", ""))
+            if cc and cc in BLOCKED_AI_COUNTRIES:
+                continue
             n["_src"] = slug
             all_nodes.append(n)
             fresh += 1
@@ -2049,6 +2192,7 @@ def cmd_connect(proxy_mode: bool, system_proxy: bool = True) -> int:
         if m == "tun":
             ensure_tun_dev()
             ensure_ip_forward()
+            setup_wsl_dns()
             try:
                 PIDFILE.unlink()
             except FileNotFoundError:
@@ -2129,6 +2273,23 @@ def cmd_connect(proxy_mode: bool, system_proxy: bool = True) -> int:
     group_test(3000)
     print(" " * 30, end="\r", flush=True)
 
+    # Verify that the active node can reach Google AI without geo-blocking
+    ok, _ = check_google_endpoint(mixed, timeout=3)
+    if not ok:
+        for name, _ptype, _delay in node_list():
+            cc = detect_country(name)
+            if cc and cc in BLOCKED_AI_COUNTRIES:
+                continue
+            if cc and cc in PREFERRED_AI_COUNTRIES:
+                try:
+                    api("/proxies/PROXY", "PUT", {"name": name})
+                    time.sleep(0.15)
+                    ok2, _ = check_google_endpoint(mixed, timeout=3)
+                    if ok2:
+                        break
+                except Exception:
+                    continue
+
     err = error_lines(log_start)
     if err:
         say(yellow("backend reported errors:"))
@@ -2178,6 +2339,7 @@ def cmd_disconnect(quiet: bool = False) -> int:
     # always restore the system proxy, even after a crash
     if BACKUP.exists():
         restore_system_proxy()
+    restore_wsl_dns()
 
     pids: list[int] = []
     if rt and rt.get("pid"):
@@ -2548,46 +2710,107 @@ def main(argv: list[str]) -> int:
     return 2
 
 
-def endpoint_ok(port: int, tries: int = 2, timeout: int = 6) -> bool:
-    """Can the current node actually reach the API agy uses? (404 = reachable.)"""
+def check_google_endpoint(port: int = PREF_MIXED_PORT, timeout: int = 5) -> tuple[bool, str]:
+    """Test whether the proxy at 127.0.0.1:port can communicate with Google Cloud Code
+    / Gemini API without being geo-blocked.
+    Returns (True, 'ok') or (False, reason)."""
+    url = "https://daily-cloudcode-pa.googleapis.com/"
+    if shutil.which("curl"):
+        try:
+            res = subprocess.run(
+                [
+                    "curl", "-s", "-S",
+                    "--max-time", str(timeout),
+                    "--proxy", f"http://127.0.0.1:{port}",
+                    "-w", "\n%{http_code}",
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout + 3,
+            )
+            out = res.stdout.strip()
+            err = res.stderr.strip().lower()
+            if res.returncode != 0:
+                if "connection refused" in err:
+                    return False, "connection refused"
+                if "timed out" in err or "operation timed out" in err:
+                    return False, "timeout"
+                if "ssl" in err:
+                    return False, "ssl handshake failed"
+                return False, f"curl error ({res.returncode})"
+
+            lines = out.splitlines()
+            code = lines[-1].strip() if lines else ""
+            body = "\n".join(lines[:-1]).lower()
+
+            if "location is not supported" in body or "failed_precondition" in body:
+                return False, "location not supported"
+
+            if code in ("200", "204", "404", "401"):
+                return True, "ok"
+
+            if code in ("400", "403"):
+                return False, "location not supported"
+
+            return False, f"http {code}"
+        except subprocess.TimeoutExpired:
+            return False, "timeout"
+        except Exception as e:
+            return False, str(e)
+
+    # Fallback to urllib if curl is not installed
+    try:
+        proxy_handler = urllib.request.ProxyHandler({
+            "http": f"http://127.0.0.1:{port}",
+            "https": f"http://127.0.0.1:{port}",
+        })
+        opener = urllib.request.build_opener(proxy_handler)
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": USER_AGENT},
+        )
+        with opener.open(req, timeout=timeout) as resp:
+            code = resp.status
+            body = resp.read(2048).decode("utf-8", errors="replace").lower()
+    except urllib.error.HTTPError as e:
+        code = e.code
+        try:
+            body = e.read(2048).decode("utf-8", errors="replace").lower()
+        except Exception:
+            body = ""
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "connection refused" in err_msg:
+            return False, "connection refused"
+        if "timed out" in err_msg:
+            return False, "timeout"
+        return False, f"connection failed: {e}"
+
+    if "location is not supported" in body or "failed_precondition" in body:
+        return False, "location not supported"
+
+    if code in (200, 204, 404, 401):
+        return True, "ok"
+
+    if code in (400, 403):
+        return False, "location not supported"
+
+    return False, f"http {code}"
+
+
+def endpoint_ok(port: int, tries: int = 2, timeout: int = 5) -> bool:
+    """Can the current node reach Google AI endpoints? Verified with check_google_endpoint."""
     for _ in range(tries):
-        if shutil.which("curl"):
-            try:
-                res = subprocess.run(
-                    ["curl", "-s", "--max-time", str(timeout),
-                     "--proxy", f"http://127.0.0.1:{port}", "-o", "/dev/null",
-                     "-w", "%{http_code}", "https://daily-cloudcode-pa.googleapis.com/"],
-                    capture_output=True, text=True, timeout=timeout + 2,
-                )
-                if res.stdout.strip() not in ("", "000"):
-                    return True
-            except Exception:
-                pass
-        else:
-            try:
-                proxy_handler = urllib.request.ProxyHandler({
-                    "http": f"http://127.0.0.1:{port}",
-                    "https": f"http://127.0.0.1:{port}",
-                })
-                opener = urllib.request.build_opener(proxy_handler)
-                req = urllib.request.Request(
-                    "https://daily-cloudcode-pa.googleapis.com/",
-                    headers={"User-Agent": USER_AGENT},
-                )
-                with opener.open(req, timeout=timeout) as resp:
-                    if resp.status in (200, 204, 404):
-                        return True
-            except urllib.error.HTTPError as e:
-                if e.code in (200, 204, 404):
-                    return True
-            except Exception:
-                pass
-        time.sleep(0.4)
+        ok, _ = check_google_endpoint(port, timeout=timeout)
+        if ok:
+            return True
+        time.sleep(0.3)
     return False
 
 
 def cmd_ensure() -> int:
-    """Used by the agy wrapper: make sure a node that can reach Google is up."""
+    """Used by the agy wrapper: make sure a node that can reach Google AI is up."""
     ensure_dirs()
     rt = load_json(RUNTIME, None)
     if not running(rt):
@@ -2596,28 +2819,49 @@ def cmd_ensure() -> int:
         rt = load_json(RUNTIME, None)
     mixed = int((rt or {}).get("mixed", PREF_MIXED_PORT))
 
-    if endpoint_ok(mixed, tries=1, timeout=5):
+    ok, reason = check_google_endpoint(mixed, timeout=4)
+    if ok:
         return 0
 
-    say(dim("current node cannot reach Google - switching ..."))
+    say(dim(f"current node cannot reach Google AI ({reason}) - switching ..."))
     try:
         api("/proxies/PROXY", "PUT", {"name": "AUTO"})
     except Exception:
         pass
     group_test(3000)
-    if endpoint_ok(mixed, tries=1, timeout=5):
+    ok, _ = check_google_endpoint(mixed, timeout=4)
+    if ok:
         say(green("switched to an automatic node"))
         return 0
 
-    for name, _ptype, _delay in node_list()[:5]:
+    # Prioritize candidate nodes: preferred AI regions first, excluding blocked regions
+    all_nodes = node_list()
+    preferred: list[str] = []
+    others: list[str] = []
+    for name, _ptype, _delay in all_nodes:
+        cc = detect_country(name)
+        if cc and cc in BLOCKED_AI_COUNTRIES:
+            continue
+        if cc and cc in PREFERRED_AI_COUNTRIES:
+            preferred.append(name)
+        else:
+            others.append(name)
+
+    candidates = preferred + others
+    tested = 0
+    for name in candidates:
+        if tested >= 25:
+            break
         try:
             api("/proxies/PROXY", "PUT", {"name": name})
         except Exception:
             continue
-        time.sleep(0.2)
-        if endpoint_ok(mixed, tries=1, timeout=4):
-            say(green(f"using {name}"))
+        time.sleep(0.15)
+        ok, r = check_google_endpoint(mixed, timeout=4)
+        if ok:
+            say(green(f"switched to AI-ready node: {name}"))
             return 0
+        tested += 1
 
     say(yellow("no node reached Google - try: fvpn -u"))
     return 1
