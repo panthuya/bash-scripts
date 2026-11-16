@@ -57,13 +57,26 @@ def _data_dir() -> Path:
     if env:
         return Path(env).expanduser()
     primary = HOME / ".fvpn"
+    alt = HOME / "Library" / "Application Support" / "fvpn"
+
+    # Under sudo, pick the same directory the real user would. Otherwise the
+    # two invocations keep separate state and each thinks fvpn is disconnected.
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        try:
+            uid = pwd.getpwnam(os.environ["SUDO_USER"]).pw_uid
+        except KeyError:
+            uid = -1
+        if primary.exists() and primary.stat().st_uid != uid:
+            return alt
+        return primary
+
     try:
         primary.mkdir(parents=True, exist_ok=True)
         if os.access(primary, os.W_OK | os.X_OK):
             return primary
     except OSError:
         pass
-    return HOME / "Library" / "Application Support" / "fvpn"
+    return alt
 
 
 DIR = _data_dir()
@@ -231,6 +244,25 @@ def ensure_dirs() -> None:
             "# Add your own with: fvpn -i <url>\n"
             + "\n".join(DEFAULT_SOURCES) + "\n"
         )
+
+
+def chown_to_user() -> None:
+    """A `sudo fvpn` run must not leave root-owned state behind."""
+    if os.geteuid() != 0 or not os.environ.get("SUDO_USER"):
+        return
+    try:
+        ent = pwd.getpwnam(os.environ["SUDO_USER"])
+    except KeyError:
+        return
+    try:
+        paths = [DIR, *DIR.rglob("*")]
+    except OSError:
+        return
+    for p in paths:
+        try:
+            os.chown(p, ent.pw_uid, ent.pw_gid)
+        except OSError:
+            pass
 
 
 def load_json(path: Path, default):
@@ -1536,7 +1568,7 @@ def cmd_geo(want: str | None = None) -> int:
 
 # ---------------------------------------------------------------- commands
 
-def cmd_connect(proxy_mode: bool) -> int:
+def cmd_connect(proxy_mode: bool, system_proxy: bool = True) -> int:
     ensure_dirs()
     rt = load_json(RUNTIME, None)
     if running(rt):
@@ -1561,55 +1593,64 @@ def cmd_connect(proxy_mode: bool) -> int:
 
     mixed = free_port(PREF_MIXED_PORT)
     ctrl = free_port(PREF_CTRL_PORT)
-    write_config(mode, mixed, ctrl, meta)
-
-    # validate before launching
-    check = subprocess.run(
-        [mihomo_bin(), "-t", "-d", str(DIR), "-f", str(CONFIG)],
-        capture_output=True, text=True, timeout=120,
-    )
-    if check.returncode != 0:
-        say(check.stderr.strip()[-1200:] or check.stdout.strip()[-1200:])
-        die("generated config is invalid")
-
     log_start = LOG.stat().st_size if LOG.exists() else 0
-    logf = open(LOG, "ab")
-    logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} connect mode={mode} =====\n".encode())
-    logf.flush()
 
-    if mode == "tun":
-        try:
-            PIDFILE.unlink()
-        except FileNotFoundError:
-            pass
-        cmd = [
-            "sudo", "sh", "-c",
-            'echo $$ > "$1"; exec "$2" -d "$3" -f "$4" -ext-ctl "127.0.0.1:$5"',
-            "sh", str(PIDFILE), mihomo_bin(), str(DIR), str(CONFIG), str(ctrl),
-        ]
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
-        pid = 0
-        for _ in range(50):
-            if PIDFILE.exists():
-                try:
-                    pid = int(PIDFILE.read_text().strip())
-                except ValueError:
-                    pid = 0
-                if pid:
-                    break
-            time.sleep(0.1)
-        if not pid:
+    def start(m: str) -> int:
+        write_config(m, mixed, ctrl, meta)
+        # validate before launching
+        check = subprocess.run(
+            [mihomo_bin(), "-t", "-d", str(DIR), "-f", str(CONFIG)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if check.returncode != 0:
+            say(check.stderr.strip()[-1200:] or check.stdout.strip()[-1200:])
+            return 0
+        lf = open(LOG, "ab")
+        lf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} connect mode={m} =====\n".encode())
+        lf.flush()
+        if m == "tun":
+            try:
+                PIDFILE.unlink()
+            except FileNotFoundError:
+                pass
+            # Keep the controlling tty: sudo's cached credential is per-tty,
+            # and start_new_session() would drop it and re-prompt (then fail).
+            argv = [
+                "sudo", "sh", "-c",
+                'trap "" HUP; echo $$ > "$1"; exec "$2" -d "$3" -f "$4" -ext-ctl "127.0.0.1:$5"',
+                "sh", str(PIDFILE), mihomo_bin(), str(DIR), str(CONFIG), str(ctrl),
+            ]
+            proc = subprocess.Popen(argv, stdout=lf, stderr=lf)
+            for _ in range(50):
+                if PIDFILE.exists():
+                    try:
+                        got = int(PIDFILE.read_text().strip())
+                    except ValueError:
+                        got = 0
+                    if got:
+                        return got
+                time.sleep(0.1)
             proc.terminate()
-            say(tail_log())
-            die("could not start the tunnel (admin rights?)")
-    else:
+            return 0
         proc = subprocess.Popen(
             [mihomo_bin(), "-d", str(DIR), "-f", str(CONFIG),
              "-ext-ctl", f"127.0.0.1:{ctrl}"],
-            stdout=logf, stderr=logf, start_new_session=True,
+            stdout=lf, stderr=lf, start_new_session=True,
         )
-        pid = proc.pid
-        PIDFILE.write_text(str(pid))
+        PIDFILE.write_text(str(proc.pid))
+        return proc.pid
+
+    pid = start(mode)
+    if not pid and mode == "tun":
+        say(yellow("TUN mode could not start (admin rights?) - using the system proxy instead"))
+        for line in tail_log(4).splitlines()[-4:]:
+            say(line)
+        mode = "proxy"
+        pid = start(mode)
+    if not pid:
+        say(tail_log())
+        cmd_disconnect(quiet=True)
+        die("backend failed to start - try 'fvpn -c --proxy', or see: fvpn logs")
 
     rt = {
         "pid": pid,
@@ -1619,6 +1660,7 @@ def cmd_connect(proxy_mode: bool) -> int:
         "started": time.time(),
         "log": str(LOG),
         "config": str(CONFIG),
+        "system_proxy": mode == "proxy" and system_proxy,
     }
     save_json(RUNTIME, rt)
 
@@ -1636,7 +1678,7 @@ def cmd_connect(proxy_mode: bool) -> int:
         cmd_disconnect(quiet=True)
         die("backend failed to start - try 'fvpn -c --proxy', or see: fvpn logs")
 
-    if mode == "proxy":
+    if mode == "proxy" and system_proxy:
         if not apply_system_proxy(mixed):
             say(yellow("  could not change the system proxy - point apps at 127.0.0.1:%d" % mixed))
 
@@ -1758,7 +1800,12 @@ def print_status() -> None:
         return
 
     mode = rt.get("mode", "?")
-    mode_txt = "TUN (all traffic)" if mode == "tun" else "system proxy"
+    if mode == "tun":
+        mode_txt = "TUN (all traffic)"
+    elif rt.get("system_proxy", True):
+        mode_txt = "system proxy"
+    else:
+        mode_txt = "proxy only (127.0.0.1:%d)" % rt.get("mixed", PREF_MIXED_PORT)
     uptime = human_uptime(time.time() - float(rt.get("started", time.time())))
     group, node = current_proxy()
     delay = delay_of(node) if node not in ("-", "AUTO") else None
@@ -1919,6 +1966,8 @@ HELP = f"""
 {cyan('connect')}
   fvpn -c                connect, TUN mode (every app, asks for admin once)
   fvpn -c --proxy        connect via macOS system proxy (no root)
+  fvpn -c --proxy --no-proxy
+                         proxy on 127.0.0.1:7890 only, leave system settings alone
   fvpn -d                disconnect and restore network settings
 
 {cyan('use')}
@@ -1931,6 +1980,7 @@ HELP = f"""
   fvpn -a                back to automatic fastest-node selection
   fvpn -g                show the exit IP and country
   fvpn -g SG             switch to the fastest node exiting in SG
+  fvpn --ensure          ensure a reachable node is up (used by the agy wrapper)
 
 {cyan('nodes')}
   fvpn -u                rebuild + verify the pool (disconnect first, ~2 min)
@@ -1973,6 +2023,7 @@ def main(argv: list[str]) -> int:
         "-p": "use", "use": "use", "--use": "use",
         "-a": "auto", "auto": "auto", "--auto": "auto",
         "-g": "geo", "geo": "geo", "--geo": "geo",
+        "--ensure": "ensure", "ensure": "ensure",
         "logs": "logs", "log": "logs",
         "-h": "help", "--help": "help", "help": "help",
         "-v": "version", "--version": "version", "version": "version",
@@ -1993,7 +2044,7 @@ def main(argv: list[str]) -> int:
         say(f"{APP} {VERSION} | backend: {mihomo_bin() if shutil.which('mihomo') or Path('/opt/homebrew/bin/mihomo').exists() else 'missing'}")
         return 0
     if cmd == "connect":
-        return cmd_connect(proxy_mode="--proxy" in flags)
+        return cmd_connect(proxy_mode="--proxy" in flags, system_proxy="--no-proxy" not in flags)
     if cmd == "disconnect":
         return cmd_disconnect()
     if cmd == "status":
@@ -2021,9 +2072,66 @@ def main(argv: list[str]) -> int:
     if cmd == "geo":
         rest = [a for a in args[1:] if not a.startswith("-")]
         return cmd_geo(rest[0] if rest else None)
+    if cmd == "ensure":
+        return cmd_ensure()
     if cmd == "logs":
         return cmd_logs(follow="-f" in args or "--follow" in args)
     return 2
+
+
+def endpoint_ok(port: int, tries: int = 2, timeout: int = 6) -> bool:
+    """Can the current node actually reach the API agy uses? (404 = reachable.)"""
+    for _ in range(tries):
+        try:
+            res = subprocess.run(
+                ["curl", "-s", "--max-time", str(timeout),
+                 "--proxy", f"http://127.0.0.1:{port}", "-o", "/dev/null",
+                 "-w", "%{http_code}", "https://daily-cloudcode-pa.googleapis.com/"],
+                capture_output=True, text=True, timeout=timeout + 2,
+            )
+            if res.stdout.strip() not in ("", "000"):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return False
+
+
+def cmd_ensure() -> int:
+    """Used by the agy wrapper: make sure a node that can reach Google is up."""
+    ensure_dirs()
+    rt = load_json(RUNTIME, None)
+    if not running(rt):
+        if cmd_connect(proxy_mode=True, system_proxy=False) != 0:
+            return 1
+        rt = load_json(RUNTIME, None)
+    mixed = int((rt or {}).get("mixed", PREF_MIXED_PORT))
+
+    if endpoint_ok(mixed, tries=1, timeout=5):
+        return 0
+
+    say(dim("current node cannot reach Google - switching ..."))
+    try:
+        api("/proxies/PROXY", "PUT", {"name": "AUTO"})
+    except Exception:
+        pass
+    group_test(3000)
+    if endpoint_ok(mixed, tries=1, timeout=5):
+        say(green("switched to an automatic node"))
+        return 0
+
+    for name, _ptype, _delay in node_list()[:5]:
+        try:
+            api("/proxies/PROXY", "PUT", {"name": name})
+        except Exception:
+            continue
+        time.sleep(0.2)
+        if endpoint_ok(mixed, tries=1, timeout=4):
+            say(green(f"using {name}"))
+            return 0
+
+    say(yellow("no node reached Google - try: fvpn -u"))
+    return 1
 
 
 if __name__ == "__main__":
@@ -2032,3 +2140,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         say("\ninterrupted")
         sys.exit(130)
+    finally:
+        chown_to_user()
