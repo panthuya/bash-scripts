@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-fvpn - a free-VPN command line client for Linux (WSL / Ubuntu) & macOS.
+fvpn - a free-VPN command line client for macOS.
 
-Backend : mihomo (Clash.Meta) single binary
-          - macOS: `brew install mihomo` or `fvpn --install-backend`
-          - Ubuntu / WSL: `fvpn --install-backend` or download from GitHub
+Backend : mihomo (Clash.Meta) single binary, installed with `brew install mihomo`
 Nodes   : free public subscription lists and/or your own subscription URL/file
 Routing : TUN mode (every app, needs admin) or system-proxy mode (no root)
 
@@ -23,11 +21,9 @@ Usage:  fvpn -c            connect
 from __future__ import annotations
 
 import base64
-import gzip
 import hashlib
 import json
 import os
-import platform
 import pwd
 import re
 import shutil
@@ -42,26 +38,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# ---------------------------------------------------------------- platform & constants
+# ---------------------------------------------------------------- constants
 
-VERSION = "1.2.0"
+VERSION = "1.0.0"
 APP = "fvpn"
-
-IS_MACOS = sys.platform == "darwin"
-IS_LINUX = sys.platform.startswith("linux")
-
-
-def _is_wsl() -> bool:
-    if not IS_LINUX:
-        return False
-    try:
-        content = Path("/proc/version").read_text().lower()
-        return "microsoft" in content or "wsl" in content
-    except Exception:
-        return False
-
-
-IS_WSL = _is_wsl()
 
 # If launched through `sudo fvpn ...`, stay in the invoking user's home.
 if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
@@ -72,16 +52,12 @@ else:
 
 def _data_dir() -> Path:
     """Prefer ~/.fvpn. If a previous root run left it unwritable, fall back to
-    Application Support (macOS) or ~/.local/share/fvpn (Linux) instead of failing."""
+    Application Support instead of failing (no sudo needed to recover)."""
     env = os.environ.get("FVPN_HOME")
     if env:
         return Path(env).expanduser()
     primary = HOME / ".fvpn"
-    if IS_MACOS:
-        alt = HOME / "Library" / "Application Support" / "fvpn"
-    else:
-        xdg = os.environ.get("XDG_DATA_HOME")
-        alt = (Path(xdg).expanduser() / "fvpn") if xdg else (HOME / ".local" / "share" / "fvpn")
+    alt = HOME / "Library" / "Application Support" / "fvpn"
 
     # Under sudo, pick the same directory the real user would. Otherwise the
     # two invocations keep separate state and each thinks fvpn is disconnected.
@@ -117,9 +93,6 @@ GEO = DIR / "geo.json"
 LOG_DIR = DIR / "logs"
 LOG = LOG_DIR / "mihomo.log"
 PIDFILE = DIR / "mihomo.pid"
-ENV_FILE = DIR / "env.sh"
-ETC_PROFILE_PROXY = Path("/etc/profile.d/fvpn_proxy.sh")
-APT_PROXY_CONF = Path("/etc/apt/apt.conf.d/99fvpn_proxy")
 
 MAX_NODES = int(os.environ.get("FVPN_MAX_NODES", "250"))
 MAX_CANDIDATES = int(os.environ.get("FVPN_MAX_CANDIDATES", "4000"))
@@ -127,63 +100,6 @@ PREF_MIXED_PORT = int(os.environ.get("FVPN_PORT", "7890"))
 PREF_CTRL_PORT = int(os.environ.get("FVPN_CTRL_PORT", "9090"))
 HEALTH_URL = "https://www.gstatic.com/generate_204"
 USER_AGENT = f"{APP}/{VERSION}"
-
-# Countries where Google AI / Gemini API is blocked or restricted:
-# Connecting through these triggers "User location is not supported for the API use".
-BLOCKED_AI_COUNTRIES = {
-    "CN", "HK", "IR", "RU", "MM", "KP", "SY", "CU", "BY", "MO"
-}
-
-# Preferred countries supporting Google AI with good latency from Asia/Global:
-PREFERRED_AI_COUNTRIES = {
-    "SG", "JP", "TW", "KR", "TH", "MY", "US", "DE", "GB", "NL", "FR", "CA", "AU"
-}
-
-
-def emoji_to_cc(s: str) -> str | None:
-    for i in range(len(s) - 1):
-        c1, c2 = ord(s[i]), ord(s[i + 1])
-        if 0x1F1E6 <= c1 <= 0x1F1FF and 0x1F1E6 <= c2 <= 0x1F1FF:
-            return chr(c1 - 0x1F1E6 + ord("A")) + chr(c2 - 0x1F1E6 + ord("A"))
-    return None
-
-
-CC_PAT = re.compile(
-    r"\b(US|SG|JP|TW|KR|TH|MY|ID|IN|DE|GB|UK|FR|CA|AU|NL|SE|ES|IT|RO|RU|HK|CN|IR|MM|VN|PH|AE|AT|CH|MX|BR|CL|ZA|EE|PL|FI|UA)\b",
-    re.I,
-)
-
-COUNTRY_WORDS = {
-    "HONG KONG": "HK", "HONGKONG": "HK",
-    "CHINA": "CN",
-    "MYANMAR": "MM", "BURMA": "MM",
-    "RUSSIA": "RU",
-    "IRAN": "IR",
-    "SINGAPORE": "SG",
-    "JAPAN": "JP",
-    "TAIWAN": "TW",
-    "THAILAND": "TH",
-    "UNITED STATES": "US", "USA": "US",
-    "SOUTH KOREA": "KR", "KOREA": "KR",
-    "GERMANY": "DE",
-    "NETHERLANDS": "NL",
-    "UNITED KINGDOM": "GB",
-}
-
-
-def detect_country(name: str) -> str | None:
-    cc = emoji_to_cc(name)
-    if cc:
-        return cc.upper()
-    upper = name.upper()
-    for word, code in COUNTRY_WORDS.items():
-        if word in upper:
-            return code
-    m = CC_PAT.search(name)
-    if m:
-        c = m.group(1).upper()
-        return "GB" if c == "UK" else c
-    return None
 
 # Public lists that answered healthy when this tool was written. Dead ones are
 # skipped automatically, so the list can safely go stale.
@@ -328,47 +244,6 @@ def ensure_dirs() -> None:
             "# Add your own with: fvpn -i <url>\n"
             + "\n".join(DEFAULT_SOURCES) + "\n"
         )
-    if IS_LINUX and DIR != (Path.home() / ".fvpn") and not (Path.home() / ".fvpn").exists():
-        try:
-            (Path.home() / ".fvpn").symlink_to(DIR)
-        except Exception:
-            pass
-    filter_provider_nodes()
-
-
-def filter_provider_nodes() -> int:
-    """Filter out cached nodes from regions known to block Google AI (CN, HK, IR, RU, MM, etc.)."""
-    removed = 0
-    updated_counts: dict[str, int] = {}
-    for f in PROVIDERS.glob("*.yaml"):
-        try:
-            data = json.loads(f.read_text())
-            proxies = data.get("proxies", [])
-            kept = []
-            for px in proxies:
-                cc = detect_country(px.get("name", ""))
-                if cc and cc in BLOCKED_AI_COUNTRIES:
-                    removed += 1
-                else:
-                    kept.append(px)
-            if len(kept) != len(proxies):
-                data["proxies"] = kept
-                f.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-            updated_counts[f.stem] = len(kept)
-        except Exception:
-            pass
-    if removed > 0 and META.exists():
-        try:
-            meta = load_json(META, {})
-            if "providers" in meta:
-                for p in meta["providers"]:
-                    slug = p.get("slug")
-                    if slug in updated_counts:
-                        p["count"] = updated_counts[slug]
-                save_json(META, meta)
-        except Exception:
-            pass
-    return removed
 
 
 def chown_to_user() -> None:
@@ -411,127 +286,11 @@ def secret() -> str:
     return SECRET_FILE.read_text().strip()
 
 
-def install_backend() -> int:
-    """Download and install the appropriate mihomo binary for this system."""
-    say(bold("installing mihomo backend"))
-    arch = platform.machine().lower()
-    is_arm = "arm" in arch or "aarch64" in arch
-
-    if IS_MACOS:
-        plat = "darwin"
-    elif IS_LINUX:
-        plat = "linux"
-    else:
-        plat = "linux"
-
-    target_arch = "arm64" if is_arm else "amd64"
-    say(dim(f"fetching release info for {plat}-{target_arch} from GitHub..."))
-
-    try:
-        req = urllib.request.Request(
-            "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest",
-            headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github.v3+json"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            rel = json.loads(r.read())
-    except Exception as e:
-        say(red(f"failed to check GitHub releases: {e}"))
-        return 1
-
-    assets = rel.get("assets", [])
-    cands = [
-        a for a in assets
-        if a.get("name", "").endswith(".gz") and plat in a.get("name", "") and target_arch in a.get("name", "")
-    ]
-
-    chosen = None
-    for a in cands:
-        if "compatible" in a["name"]:
-            chosen = a
-            break
-    if not chosen:
-        for a in cands:
-            if "v1" in a["name"] and not any(x in a["name"] for x in ("go120", "go123")):
-                chosen = a
-                break
-    if not chosen and cands:
-        chosen = cands[0]
-
-    if not chosen:
-        say(red(f"no prebuilt mihomo binary found for {plat}-{target_arch}"))
-        return 1
-
-    url = chosen["browser_download_url"]
-    say(dim(f"downloading {chosen['name']} ..."))
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=120) as r:
-            compressed = r.read()
-    except Exception as e:
-        say(red(f"download failed: {e}"))
-        return 1
-
-    say(dim("extracting ..."))
-    try:
-        decompressed = gzip.decompress(compressed)
-    except Exception as e:
-        say(red(f"extraction failed: {e}"))
-        return 1
-
-    dest_dir = DIR / "bin"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_bin = dest_dir / "mihomo"
-    dest_bin.write_bytes(decompressed)
-    os.chmod(dest_bin, 0o755)
-
-    # Also try creating symlink in ~/.local/bin if directory exists
-    local_bin = HOME / ".local" / "bin"
-    if local_bin.exists() and os.access(local_bin, os.W_OK):
-        link_target = local_bin / "mihomo"
-        try:
-            if link_target.is_symlink() or link_target.exists():
-                link_target.unlink()
-            link_target.symlink_to(dest_bin)
-        except OSError:
-            pass
-
-    say(green(f"mihomo installed successfully to {dest_bin}"))
-    return 0
-
-
 def mihomo_bin() -> str:
-    found = shutil.which("mihomo")
-    if found:
-        return found
-
-    candidates = [
-        DIR / "bin" / "mihomo",
-        HOME / ".local" / "bin" / "mihomo",
-        Path("/usr/local/bin/mihomo"),
-        Path("/usr/bin/mihomo"),
-        Path("/home/linuxbrew/.linuxbrew/bin/mihomo"),
-        Path("/opt/homebrew/bin/mihomo"),
-    ]
-    for cand in candidates:
-        if cand and cand.exists() and os.access(cand, os.X_OK):
-            return str(cand)
-
-    if TTY and not os.environ.get("CI") and sys.stdin.isatty():
-        say(yellow("mihomo backend is not installed."))
-        try:
-            ans = input("Would you like fvpn to download and install mihomo now? [Y/n] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "n"
-        if ans in ("", "y", "yes"):
-            if install_backend() == 0:
-                return mihomo_bin()
-
-    if IS_MACOS:
-        die("mihomo is not installed. Run: brew install mihomo")
-    else:
-        die("mihomo is not installed.\n"
-            "  Run: fvpn --install-backend  to auto-download it,\n"
-            "  or install manually from: https://github.com/MetaCubeX/mihomo/releases")
+    for cand in (shutil.which("mihomo"), "/opt/homebrew/bin/mihomo", "/usr/local/bin/mihomo"):
+        if cand and Path(cand).exists():
+            return cand
+    die("mihomo is not installed. Run: brew install mihomo")
 
 
 def free_port(start: int) -> int:
@@ -617,197 +376,34 @@ def running(rt: dict | None = None) -> bool:
 
 
 def find_mihomo_pids() -> list[int]:
-    pids = []
     try:
         out = subprocess.run(
-            ["pgrep", "-f", f"mihomo.*{DIR}"],
+            ["pgrep", "-f", f"mihomo -d {DIR}"],
             capture_output=True, text=True, timeout=5,
         ).stdout
-        pids = [int(x) for x in out.split() if x.isdigit()]
+        return [int(x) for x in out.split() if x.isdigit()]
     except Exception:
-        pass
-    if not pids and IS_LINUX:
-        try:
-            for p in Path("/proc").glob("[0-9]*"):
-                try:
-                    cmdline = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
-                    if "mihomo" in cmdline and str(DIR) in cmdline:
-                        pids.append(int(p.name))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    return pids
+        return []
 
 
 def heal_stale_proxy() -> None:
-    """If proxy settings or environment profile are left behind from a crashed or
-    stopped mihomo, restore clean network settings."""
-    has_stale = (
-        BACKUP.exists()
-        or (IS_LINUX and ETC_PROFILE_PROXY.exists())
-        or (IS_WSL and (DIR / "resolv.conf.bak").exists())
-    )
-    if has_stale and not running():
+    """macOS keeps proxy settings across reboots. If they point at a mihomo
+    that is no longer running, put the previous settings back."""
+    if BACKUP.exists() and not running():
         restore_system_proxy()
-        restore_wsl_dns()
 
 
 def ensure_sudo() -> bool:
     if os.geteuid() == 0:
         return True
-    if shutil.which("sudo") is None:
-        return False
     if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
         return True
     say(dim("TUN mode needs admin rights once (it routes every app)."))
     return subprocess.run(["sudo", "-v"]).returncode == 0
 
 
-def ensure_tun_dev() -> None:
-    """Ensure /dev/net/tun exists (often missing on fresh WSL2)."""
-    if not IS_LINUX:
-        return
-    tun_path = Path("/dev/net/tun")
-    if tun_path.exists():
-        return
-    say(dim("creating /dev/net/tun device node for TUN mode..."))
-    cmd = "mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 666 /dev/net/tun"
-    if os.geteuid() == 0:
-        subprocess.run(cmd, shell=True, capture_output=True)
-    elif ensure_sudo():
-        subprocess.run(["sudo", "sh", "-c", cmd], capture_output=True)
-
-
-def ensure_ip_forward() -> None:
-    """Enable IPv4 forwarding on Linux for TUN routing."""
-    if not IS_LINUX:
-        return
-    try:
-        p = Path("/proc/sys/net/ipv4/ip_forward")
-        if p.exists() and p.read_text().strip() == "1":
-            return
-    except Exception:
-        pass
-    if os.geteuid() == 0:
-        subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], capture_output=True)
-    elif ensure_sudo():
-        subprocess.run(["sudo", "-n", "sysctl", "-w", "net.ipv4.ip_forward=1"], capture_output=True)
-
-
-def setup_wsl_dns() -> None:
-    """In WSL2, configure /etc/resolv.conf to query 223.5.5.5, 1.1.1.1, and 8.8.8.8 so DNS
-    queries enter the TUN adapter and are intercepted by Fake-IP instead of
-    leaking directly to the local Windows host ISP."""
-    if not IS_WSL:
-        return
-    resolv = Path("/etc/resolv.conf")
-    backup = DIR / "resolv.conf.bak"
-    try:
-        if resolv.exists():
-            current_text = resolv.read_text(errors="replace")
-            if "223.5.5.5" in current_text and "1.1.1.1" in current_text:
-                return
-            if not backup.exists():
-                backup.write_text(current_text)
-        new_content = "# Generated by fvpn for WSL TUN mode\nnameserver 223.5.5.5\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n"
-        if os.geteuid() == 0:
-            if resolv.is_symlink():
-                try:
-                    resolv.unlink()
-                except OSError:
-                    pass
-            resolv.write_text(new_content)
-        else:
-            subprocess.run(
-                ["sudo", "-n", "sh", "-c", f"rm -f {resolv} && cat > {resolv}"],
-                input=new_content, text=True, capture_output=True,
-            )
-        say(dim("  WSL DNS updated -> 223.5.5.5, 1.1.1.1, 8.8.8.8 (routed through TUN)"))
-    except Exception:
-        pass
-
-
-def restore_wsl_dns() -> None:
-    """Restore original /etc/resolv.conf in WSL2 when disconnecting."""
-    if not IS_WSL:
-        return
-    backup = DIR / "resolv.conf.bak"
-    resolv = Path("/etc/resolv.conf")
-    if backup.exists():
-        try:
-            content = backup.read_text(errors="replace")
-            if os.geteuid() == 0:
-                resolv.write_text(content)
-            else:
-                subprocess.run(
-                    ["sudo", "-n", "sh", "-c", f"cat > {resolv}"],
-                    input=content, text=True, capture_output=True,
-                )
-            backup.unlink()
-            say(dim("  WSL DNS restored"))
-        except Exception:
-            pass
-
-
-def get_default_interface() -> str | None:
-    if IS_MACOS:
-        try:
-            out = subprocess.run(
-                ["route", "-n", "get", "default"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout
-            m = re.search(r"interface:\s*(\S+)", out)
-            if m:
-                return m.group(1)
-        except Exception:
-            pass
-        return None
-    elif IS_LINUX:
-        try:
-            out = subprocess.run(
-                ["ip", "route", "show", "default"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout
-            m = re.search(r"dev\s+(\S+)", out)
-            if m:
-                return m.group(1)
-        except Exception:
-            pass
-        try:
-            with open("/proc/net/route", "r") as f:
-                for line in f.readlines()[1:]:
-                    parts = line.strip().split()
-                    if len(parts) >= 2 and parts[1] == "00000000":
-                        return parts[0]
-        except Exception:
-            pass
-        for cand in ("eth0", "wlan0", "enp0s3"):
-            if Path(f"/sys/class/net/{cand}").exists():
-                return cand
-        return None
-    return None
-
-
-def get_interface_mtu(iface: str | None) -> int:
-    if not iface:
-        return 1500
-    if IS_LINUX:
-        try:
-            p = Path(f"/sys/class/net/{iface}/mtu")
-            if p.exists():
-                val = int(p.read_text().strip())
-                if 576 <= val <= 9000:
-                    return val
-        except Exception:
-            pass
-    return 1500
-
-
 def run_ns(*args: str, timeout: float = 15) -> subprocess.CompletedProcess:
-    """networksetup wrapper for macOS; retries with cached sudo when needed."""
-    if not IS_MACOS:
-        return subprocess.CompletedProcess(["networksetup", *args], 1, "", "networksetup only exists on macOS")
+    """networksetup wrapper; retries with cached sudo when needed."""
     res = subprocess.run(["networksetup", *args], capture_output=True, text=True, timeout=timeout)
     if res.returncode != 0 and os.geteuid() != 0:
         res2 = subprocess.run(
@@ -1334,8 +930,8 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
 
     cfg: dict = {
         "mixed-port": mixed,
-        "allow-lan": True if IS_LINUX else False,
-        "bind-address": "*" if IS_LINUX else "127.0.0.1",
+        "allow-lan": False,
+        "bind-address": "127.0.0.1",
         "mode": "rule",
         "log-level": "warning",
         "ipv6": True,
@@ -1351,15 +947,9 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
             "listen": "0.0.0.0:1053",
             "enhanced-mode": "fake-ip",
             "fake-ip-range": "198.18.0.1/16",
-            "default-nameserver": ["223.5.5.5", "1.1.1.1", "8.8.8.8", "9.9.9.9"],
-            "nameserver": [
-                "https://1.1.1.1/dns-query",
-                "https://8.8.8.8/dns-query",
-                "223.5.5.5",
-                "1.1.1.1",
-                "8.8.8.8",
-            ],
-            "proxy-server-nameserver": ["223.5.5.5", "1.1.1.1", "8.8.8.8", "9.9.9.9"],
+            "default-nameserver": ["223.5.5.5", "223.6.6.6"],
+            "nameserver": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
+            "proxy-server-nameserver": ["223.5.5.5", "1.1.1.1"],
         },
         "proxy-providers": {
             slug: {
@@ -1370,7 +960,6 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
                     "url": HEALTH_URL,
                     "interval": 300,
                 },
-                "exclude-filter": r"(?i)HK|Hong|🇭🇰|CN|China|🇨🇳|MM|Myanmar|Burma|🇲🇲|RU|Russia|🇷🇺|IR|Iran|🇮🇷|KP|North Korea|🇰🇵|SY|Syria|CU|Cuba|BY|Belarus",
             }
             for slug in slugs
         },
@@ -1383,7 +972,6 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
                 "interval": 300,
                 "tolerance": 50,
                 "lazy": False,
-                "exclude-filter": r"(?i)HK|Hong|🇭🇰|CN|China|🇨🇳|MM|Myanmar|Burma|🇲🇲|RU|Russia|🇷🇺|IR|Iran|🇮🇷|KP|North Korea|🇰🇵|SY|Syria|CU|Cuba|BY|Belarus",
             },
             {
                 "name": "PROXY",
@@ -1410,20 +998,13 @@ def build_config(mode: str, mixed: int, ctrl: int, meta: dict) -> dict:
         ],
     }
     if mode == "tun":
-        mtu = 1500
-        if IS_LINUX:
-            dev = get_default_interface()
-            if dev:
-                dev_mtu = get_interface_mtu(dev)
-                if 1200 <= dev_mtu < 1500:
-                    mtu = dev_mtu
         cfg["tun"] = {
             "enable": True,
             "stack": "gvisor",
             "auto-route": True,
             "auto-detect-interface": True,
-            "dns-hijack": ["any:53", "tcp://any:53"],
-            "mtu": mtu,
+            "dns-hijack": ["any:53"],
+            "mtu": 1500,
         }
     return cfg
 
@@ -1437,9 +1018,7 @@ def write_config(mode: str, mixed: int, ctrl: int, meta: dict) -> None:
 
 # ---------------------------------------------------------------- system proxy
 
-def list_services_macos() -> list[tuple[str, str]]:
-    if not IS_MACOS:
-        return []
+def list_services() -> list[tuple[str, str]]:
     try:
         out = subprocess.run(
             ["networksetup", "-listnetworkserviceorder"],
@@ -1459,14 +1038,7 @@ def list_services_macos() -> list[tuple[str, str]]:
     return services
 
 
-def list_services() -> list[tuple[str, str]]:
-    if IS_MACOS:
-        return list_services_macos()
-    dev = get_default_interface() or "eth0"
-    return [(dev, dev)]
-
-
-def active_service_macos() -> str:
+def active_service() -> str:
     iface = None
     try:
         out = subprocess.run(
@@ -1477,16 +1049,10 @@ def active_service_macos() -> str:
         iface = m.group(1) if m else None
     except Exception:
         pass
-    for svc, dev in list_services_macos():
+    for svc, dev in list_services():
         if dev and dev == iface:
             return svc
     return "Wi-Fi"
-
-
-def active_service() -> str:
-    if IS_MACOS:
-        return active_service_macos()
-    return get_default_interface() or "eth0"
 
 
 PROXY_KINDS = [
@@ -1511,7 +1077,7 @@ def parse_proxy_out(text: str) -> dict:
     return d
 
 
-def get_bypass_macos(service: str) -> list[str]:
+def get_bypass(service: str) -> list[str]:
     res = run_ns("-getproxybypassdomains", service)
     if res.returncode != 0:
         return []
@@ -1521,15 +1087,9 @@ def get_bypass_macos(service: str) -> list[str]:
     return vals
 
 
-def get_bypass(service: str) -> list[str]:
-    if IS_MACOS:
-        return get_bypass_macos(service)
-    return []
-
-
-def apply_system_proxy_macos(port: int) -> bool:
-    service = active_service_macos()
-    backup = {"platform": "macos", "service": service, "kinds": {}, "bypass": get_bypass_macos(service)}
+def apply_system_proxy(port: int) -> bool:
+    service = active_service()
+    backup = {"service": service, "kinds": {}, "bypass": get_bypass(service)}
     for kind, getter, setter, stater in PROXY_KINDS:
         res = run_ns(getter, service)
         backup["kinds"][kind] = parse_proxy_out(res.stdout) if res.returncode == 0 else {"enabled": False, "server": "", "port": 0}
@@ -1547,7 +1107,7 @@ def apply_system_proxy_macos(port: int) -> bool:
     return ok
 
 
-def restore_system_proxy_macos() -> None:
+def restore_system_proxy() -> None:
     backup = load_json(BACKUP, None)
     if not backup:
         return
@@ -1569,145 +1129,6 @@ def restore_system_proxy_macos() -> None:
     except FileNotFoundError:
         pass
     say(dim(f"  system proxy restored on {service}"))
-
-
-def apply_system_proxy_linux(port: int) -> bool:
-    backup = {"platform": "linux", "port": port}
-    save_json(BACKUP, backup)
-
-    env_content = f"""# Generated by fvpn - source this file or run: eval $(fvpn env)
-export http_proxy="http://127.0.0.1:{port}"
-export https_proxy="http://127.0.0.1:{port}"
-export ftp_proxy="http://127.0.0.1:{port}"
-export all_proxy="socks5://127.0.0.1:{port}"
-export HTTP_PROXY="http://127.0.0.1:{port}"
-export HTTPS_PROXY="http://127.0.0.1:{port}"
-export FTP_PROXY="http://127.0.0.1:{port}"
-export ALL_PROXY="socks5://127.0.0.1:{port}"
-export no_proxy="localhost,127.0.0.1,::1,local.home"
-export NO_PROXY="localhost,127.0.0.1,::1,local.home"
-"""
-    try:
-        ENV_FILE.write_text(env_content)
-    except OSError:
-        pass
-
-    # Try setting /etc/profile.d/fvpn_proxy.sh
-    if os.geteuid() == 0:
-        try:
-            ETC_PROFILE_PROXY.write_text(env_content)
-        except Exception:
-            pass
-    elif subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
-        subprocess.run(
-            ["sudo", "-n", "sh", "-c", f"cat > {ETC_PROFILE_PROXY}"],
-            input=env_content, text=True, capture_output=True,
-        )
-
-    # Try configuring APT proxy on Ubuntu/Debian
-    apt_content = f"""Acquire::http::Proxy "http://127.0.0.1:{port}/";
-Acquire::https::Proxy "http://127.0.0.1:{port}/";
-"""
-    if Path("/etc/apt/apt.conf.d").exists():
-        if os.geteuid() == 0:
-            try:
-                APT_PROXY_CONF.write_text(apt_content)
-            except Exception:
-                pass
-        elif subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
-            subprocess.run(
-                ["sudo", "-n", "sh", "-c", f"cat > {APT_PROXY_CONF}"],
-                input=apt_content, text=True, capture_output=True,
-            )
-
-    # If gsettings is available (e.g. WSLg / Ubuntu desktop), configure GNOME proxy
-    if shutil.which("gsettings"):
-        try:
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"], capture_output=True)
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy.http", "host", "127.0.0.1"], capture_output=True)
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy.http", "port", str(port)], capture_output=True)
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy.https", "host", "127.0.0.1"], capture_output=True)
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy.https", "port", str(port)], capture_output=True)
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"], capture_output=True)
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy.socks", "port", str(port)], capture_output=True)
-        except Exception:
-            pass
-
-    say(dim(f"  system proxy configured -> 127.0.0.1:{port}"))
-    say(dim(f"  to apply in current shell: eval $(fvpn env)"))
-    return True
-
-
-def restore_system_proxy_linux() -> None:
-    try:
-        unset_content = """# fvpn disconnected - unsetting proxy env variables
-unset http_proxy https_proxy ftp_proxy all_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY no_proxy NO_PROXY
-"""
-        ENV_FILE.write_text(unset_content)
-    except OSError:
-        pass
-
-    if ETC_PROFILE_PROXY.exists():
-        if os.geteuid() == 0:
-            try:
-                ETC_PROFILE_PROXY.unlink()
-            except Exception:
-                pass
-        else:
-            subprocess.run(["sudo", "-n", "rm", "-f", str(ETC_PROFILE_PROXY)], capture_output=True)
-
-    if APT_PROXY_CONF.exists():
-        if os.geteuid() == 0:
-            try:
-                APT_PROXY_CONF.unlink()
-            except Exception:
-                pass
-        else:
-            subprocess.run(["sudo", "-n", "rm", "-f", str(APT_PROXY_CONF)], capture_output=True)
-
-    if shutil.which("gsettings"):
-        try:
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "mode", "none"], capture_output=True)
-        except Exception:
-            pass
-
-    try:
-        BACKUP.unlink()
-    except FileNotFoundError:
-        pass
-    say(dim("  system proxy restored"))
-
-
-def apply_system_proxy(port: int) -> bool:
-    if IS_MACOS:
-        return apply_system_proxy_macos(port)
-    return apply_system_proxy_linux(port)
-
-
-def restore_system_proxy() -> None:
-    if IS_MACOS:
-        restore_system_proxy_macos()
-    else:
-        restore_system_proxy_linux()
-
-
-def cmd_env(unset: bool = False) -> int:
-    if unset:
-        print("unset http_proxy https_proxy ftp_proxy all_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY no_proxy NO_PROXY")
-        return 0
-    rt = load_json(RUNTIME, None)
-    port = rt.get("mixed", PREF_MIXED_PORT) if rt else PREF_MIXED_PORT
-    print(f'export http_proxy="http://127.0.0.1:{port}"')
-    print(f'export https_proxy="http://127.0.0.1:{port}"')
-    print(f'export ftp_proxy="http://127.0.0.1:{port}"')
-    print(f'export all_proxy="socks5://127.0.0.1:{port}"')
-    print(f'export HTTP_PROXY="http://127.0.0.1:{port}"')
-    print(f'export HTTPS_PROXY="http://127.0.0.1:{port}"')
-    print(f'export FTP_PROXY="http://127.0.0.1:{port}"')
-    print(f'export ALL_PROXY="socks5://127.0.0.1:{port}"')
-    print('export no_proxy="localhost,127.0.0.1,::1,local.home"')
-    print('export NO_PROXY="localhost,127.0.0.1,::1,local.home"')
-    return 0
 
 
 # ---------------------------------------------------------------- update
@@ -1841,9 +1262,6 @@ def cmd_update(no_test: bool = False) -> int:
             if k in seen:
                 continue
             seen.add(k)
-            cc = detect_country(n.get("name", ""))
-            if cc and cc in BLOCKED_AI_COUNTRIES:
-                continue
             n["_src"] = slug
             all_nodes.append(n)
             fresh += 1
@@ -2052,42 +1470,22 @@ def group_test(timeout_ms: int = 4000) -> dict:
 def geo_lookup(port: int, timeout: int = 7) -> dict | None:
     """Exit IP / country as seen from outside, through the local proxy."""
     for url in ("https://ipinfo.io/json", "https://ipapi.co/json/"):
-        raw = None
-        if shutil.which("curl"):
-            try:
-                res = subprocess.run(
-                    ["curl", "-sS", "--max-time", str(timeout),
-                     "--proxy", f"http://127.0.0.1:{port}", url],
-                    capture_output=True, text=True, timeout=timeout + 3,
-                )
-                if res.returncode == 0 and res.stdout.strip():
-                    raw = res.stdout
-            except Exception:
-                pass
-        if not raw:
-            try:
-                proxy_handler = urllib.request.ProxyHandler({
-                    "http": f"http://127.0.0.1:{port}",
-                    "https": f"http://127.0.0.1:{port}",
-                })
-                opener = urllib.request.build_opener(proxy_handler)
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                with opener.open(req, timeout=timeout) as resp:
-                    raw = resp.read().decode("utf-8", "replace")
-            except Exception:
-                pass
-        if raw:
-            try:
-                js = json.loads(raw)
-                cc = (js.get("country") or js.get("country_code") or "").upper()
-                if cc:
-                    return {
-                        "country": cc,
-                        "ip": js.get("ip") or "",
-                        "org": js.get("org") or js.get("asn") or "",
-                    }
-            except Exception:
-                continue
+        try:
+            res = subprocess.run(
+                ["curl", "-sS", "--max-time", str(timeout),
+                 "--proxy", f"http://127.0.0.1:{port}", url],
+                capture_output=True, text=True, timeout=timeout + 3,
+            )
+            js = json.loads(res.stdout)
+            cc = (js.get("country") or js.get("country_code") or "").upper()
+            if cc:
+                return {
+                    "country": cc,
+                    "ip": js.get("ip") or "",
+                    "org": js.get("org") or js.get("asn") or "",
+                }
+        except Exception:
+            continue
     return None
 
 
@@ -2211,18 +1609,14 @@ def cmd_connect(proxy_mode: bool, system_proxy: bool = True) -> int:
         lf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} connect mode={m} =====\n".encode())
         lf.flush()
         if m == "tun":
-            ensure_tun_dev()
-            ensure_ip_forward()
-            setup_wsl_dns()
             try:
                 PIDFILE.unlink()
             except FileNotFoundError:
                 pass
             # Keep the controlling tty: sudo's cached credential is per-tty,
             # and start_new_session() would drop it and re-prompt (then fail).
-            sudo_prefix = ["sudo"] if os.geteuid() != 0 else []
-            argv = sudo_prefix + [
-                "sh", "-c",
+            argv = [
+                "sudo", "sh", "-c",
                 'trap "" HUP; echo $$ > "$1"; exec "$2" -d "$3" -f "$4" -ext-ctl "127.0.0.1:$5"',
                 "sh", str(PIDFILE), mihomo_bin(), str(DIR), str(CONFIG), str(ctrl),
             ]
@@ -2294,32 +1688,6 @@ def cmd_connect(proxy_mode: bool, system_proxy: bool = True) -> int:
     group_test(3000)
     print(" " * 30, end="\r", flush=True)
 
-    # Verify that the active node can reach Google AI without geo-blocking
-    ok, _ = check_google_endpoint(mixed, timeout=5)
-    geo = geo_lookup(mixed, timeout=4) if ok else None
-    if not ok or (geo and geo.get("country") in BLOCKED_AI_COUNTRIES):
-        switched = False
-        for name, _ptype, _delay in node_list():
-            cc = detect_country(name)
-            if cc and cc in BLOCKED_AI_COUNTRIES:
-                continue
-            if cc and cc in PREFERRED_AI_COUNTRIES:
-                try:
-                    api("/proxies/PROXY", "PUT", {"name": name})
-                    time.sleep(0.2)
-                    ok2, _ = check_google_endpoint(mixed, timeout=5)
-                    geo2 = geo_lookup(mixed, timeout=4) if ok2 else None
-                    if ok2 and (not geo2 or geo2.get("country") not in BLOCKED_AI_COUNTRIES):
-                        switched = True
-                        break
-                except Exception:
-                    continue
-        if not switched:
-            try:
-                api("/proxies/PROXY", "PUT", {"name": "AUTO"})
-            except Exception:
-                pass
-
     err = error_lines(log_start)
     if err:
         say(yellow("backend reported errors:"))
@@ -2369,7 +1737,6 @@ def cmd_disconnect(quiet: bool = False) -> int:
     # always restore the system proxy, even after a crash
     if BACKUP.exists():
         restore_system_proxy()
-    restore_wsl_dns()
 
     pids: list[int] = []
     if rt and rt.get("pid"):
@@ -2403,16 +1770,7 @@ def cmd_disconnect(quiet: bool = False) -> int:
 
     if mode == "tun" or os.geteuid() == 0:
         # root-owned cache.db would break the next non-root run
-        target_uid = os.getuid()
-        target_gid = os.getgid()
-        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
-            try:
-                ent = pwd.getpwnam(os.environ["SUDO_USER"])
-                target_uid = ent.pw_uid
-                target_gid = ent.pw_gid
-            except KeyError:
-                pass
-        chown = ["chown", "-R", f"{target_uid}:{target_gid}", str(DIR)]
+        chown = ["chown", "-R", f"{os.getuid()}:{os.getgid()}", str(DIR)]
         if subprocess.run(["sudo", "-n", *chown], capture_output=True).returncode != 0:
             if os.geteuid() == 0:
                 subprocess.run(chown, capture_output=True)
@@ -2452,9 +1810,7 @@ def print_status() -> None:
     group, node = current_proxy()
     delay = delay_of(node) if node not in ("-", "AUTO") else None
 
-    os_info = "WSL Ubuntu" if IS_WSL else ("Linux" if IS_LINUX else ("macOS" if IS_MACOS else sys.platform))
     say(bold("fvpn status"))
-    say(f"  system   {os_info}")
     say(f"  state    {green('connected')}  {dim(uptime)}")
     say(f"  mode     {mode_txt}")
     if node and node != "-":
@@ -2605,11 +1961,11 @@ def cmd_logs(follow: bool = False) -> int:
 # ---------------------------------------------------------------- help
 
 HELP = f"""
-{bold('fvpn')} {dim('v' + VERSION)} - free VPN client for Linux (WSL / Ubuntu) & macOS {dim('(mihomo backend)')}
+{bold('fvpn')} {dim('v' + VERSION)} - free VPN client for macOS {dim('(mihomo backend)')}
 
 {cyan('connect')}
   fvpn -c                connect, TUN mode (every app, asks for admin once)
-  fvpn -c --proxy        connect via system proxy (no root)
+  fvpn -c --proxy        connect via macOS system proxy (no root)
   fvpn -c --proxy --no-proxy
                          proxy on 127.0.0.1:7890 only, leave system settings alone
   fvpn -d                disconnect and restore network settings
@@ -2625,17 +1981,11 @@ HELP = f"""
   fvpn -g                show the exit IP and country
   fvpn -g SG             switch to the fastest node exiting in SG
   fvpn --ensure          ensure a reachable node is up (used by the agy wrapper)
-  fvpn env               print shell exports for proxy mode: eval $(fvpn env)
-  fvpn env --unset       print shell unsets: eval $(fvpn env --unset)
 
 {cyan('nodes')}
   fvpn -u                rebuild + verify the pool (disconnect first, ~2 min)
   fvpn -u --no-test      skip verification (faster, but nodes may be dead)
   fvpn -i <url|file>     add your own subscription, then: fvpn -u
-
-{cyan('backend')}
-  fvpn --install-backend auto-download and install mihomo for your system
-  fvpn wrap-agy          wrap agy CLI so it automatically routes through fvpn
 
 {cyan('other')}
   fvpn logs [-f]         show / follow the backend log
@@ -2649,78 +1999,6 @@ HELP = f"""
 {dim('Free public nodes are run by strangers: assume they can see your traffic.')} 
 {dim('Use them for casual browsing, not banking or work logins.')}
 """
-
-
-def cmd_wrap_agy() -> int:
-    """Install or update ~/.local/bin/agy wrapper for Antigravity CLI."""
-    agy_path = shutil.which("agy")
-    candidates = [
-        HOME / ".local" / "bin" / "agy",
-        Path("/usr/local/bin/agy"),
-    ]
-    target = None
-    if agy_path:
-        target = Path(agy_path)
-    else:
-        for c in candidates:
-            if c.exists():
-                target = c
-                break
-    if not target or not target.exists():
-        target = HOME / ".local" / "bin" / "agy"
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-    real_bin = target.parent / f"{target.name}.real"
-    try:
-        content = target.read_text(errors="replace") if target.exists() else ""
-    except Exception:
-        content = ""
-
-    if "# agy wrapper: route through fvpn" in content and real_bin.exists():
-        say(green(f"agy is already wrapped at {target}"))
-        return 0
-
-    if target.exists() and not real_bin.exists():
-        target.rename(real_bin)
-
-    wrapper_script = f"""#!/usr/bin/env bash
-# agy wrapper: route through fvpn/mihomo, starting it when necessary.
-# agy is a Go binary and ignores Linux system proxy, so set env vars.
-PROXY="http://127.0.0.1:7890"
-
-FDIR="$HOME/.fvpn"
-[ -r "$FDIR/meta.json" ] || FDIR="$HOME/.local/share/fvpn"
-[ -r "$FDIR/meta.json" ] || FDIR="$HOME/Library/Application Support/fvpn"
-
-if [ -z "${{FVPN_NO_AUTOSTART:-}}" ] && [ -r "$FDIR/meta.json" ]; then
-  if ! nc -z -w 1 127.0.0.1 7890 >/dev/null 2>&1; then
-    echo "fvpn: tunnel is not running - starting it..." >&2
-  fi
-  fvpn --ensure >/dev/null 2>&1 || true
-fi
-
-if nc -z -w 1 127.0.0.1 7890 >/dev/null 2>&1; then
-  export HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" ALL_PROXY="$PROXY"
-  export http_proxy="$PROXY" https_proxy="$PROXY" all_proxy="$PROXY"
-  export NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
-else
-  echo "fvpn: not connected - agy will use direct connection." >&2
-fi
-
-if [ -x "{real_bin}" ]; then
-  exec "{real_bin}" "$@"
-elif command -v agy.real >/dev/null 2>&1; then
-  exec agy.real "$@"
-else
-  echo "Error: {real_bin} not found" >&2
-  exit 1
-fi
-"""
-    target.write_text(wrapper_script)
-    target.chmod(0o755)
-    say(green(f"successfully wrapped agy at {target}"))
-    say(dim("  agy will now automatically route through fvpn with proxy env vars!"))
-    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -2746,9 +2024,6 @@ def main(argv: list[str]) -> int:
         "-a": "auto", "auto": "auto", "--auto": "auto",
         "-g": "geo", "geo": "geo", "--geo": "geo",
         "--ensure": "ensure", "ensure": "ensure",
-        "env": "env", "--env": "env",
-        "--install-backend": "install_backend", "install-backend": "install_backend",
-        "wrap-agy": "wrap_agy", "wrap_agy": "wrap_agy", "--wrap-agy": "wrap_agy",
         "logs": "logs", "log": "logs",
         "-h": "help", "--help": "help", "help": "help",
         "-v": "version", "--version": "version", "version": "version",
@@ -2766,20 +2041,8 @@ def main(argv: list[str]) -> int:
         print(HELP)
         return 0
     if cmd == "version":
-        backend_path = None
-        try:
-            backend_path = mihomo_bin()
-        except SystemExit:
-            pass
-        os_info = "WSL Ubuntu" if IS_WSL else ("Linux" if IS_LINUX else ("macOS" if IS_MACOS else sys.platform))
-        say(f"{APP} {VERSION} ({os_info}) | backend: {backend_path or 'missing'}")
+        say(f"{APP} {VERSION} | backend: {mihomo_bin() if shutil.which('mihomo') or Path('/opt/homebrew/bin/mihomo').exists() else 'missing'}")
         return 0
-    if cmd == "install_backend":
-        return install_backend()
-    if cmd == "wrap_agy":
-        return cmd_wrap_agy()
-    if cmd == "env":
-        return cmd_env(unset="--unset" in flags or "-u" in args or "--unset" in args)
     if cmd == "connect":
         return cmd_connect(proxy_mode="--proxy" in flags, system_proxy="--no-proxy" not in flags)
     if cmd == "disconnect":
@@ -2816,101 +2079,26 @@ def main(argv: list[str]) -> int:
     return 2
 
 
-def check_google_endpoint(port: int = PREF_MIXED_PORT, timeout: int = 5) -> tuple[bool, str]:
-    """Test whether the proxy at 127.0.0.1:port can communicate with Google Cloud Code
-    / Gemini API without being geo-blocked.
-    Returns (True, 'ok') or (False, reason)."""
-    url = "https://daily-cloudcode-pa.googleapis.com/"
-    if shutil.which("curl"):
+def endpoint_ok(port: int, tries: int = 2, timeout: int = 6) -> bool:
+    """Can the current node actually reach the API agy uses? (404 = reachable.)"""
+    for _ in range(tries):
         try:
             res = subprocess.run(
-                [
-                    "curl", "-s", "-S",
-                    "--max-time", str(timeout),
-                    "--proxy", f"http://127.0.0.1:{port}",
-                    "-w", "\n%{http_code}",
-                    url,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=timeout + 3,
+                ["curl", "-s", "--max-time", str(timeout),
+                 "--proxy", f"http://127.0.0.1:{port}", "-o", "/dev/null",
+                 "-w", "%{http_code}", "https://daily-cloudcode-pa.googleapis.com/"],
+                capture_output=True, text=True, timeout=timeout + 2,
             )
-            out = res.stdout.strip()
-            err = res.stderr.strip().lower()
-            if res.returncode != 0:
-                if "connection refused" in err:
-                    return False, "connection refused"
-                if "timed out" in err or "operation timed out" in err:
-                    return False, "timeout"
-                if "ssl" in err:
-                    return False, "ssl handshake failed"
-                return False, f"curl error ({res.returncode})"
-
-            lines = out.splitlines()
-            code = lines[-1].strip() if lines else ""
-            body = "\n".join(lines[:-1]).lower()
-
-            if "location is not supported" in body or "failed_precondition" in body or "user location is not supported" in body:
-                return False, "location not supported"
-
-            if code in ("200", "204", "400", "401", "403", "404"):
-                return True, "ok"
-
-            return False, f"http {code}"
-        except subprocess.TimeoutExpired:
-            return False, "timeout"
-        except Exception as e:
-            return False, str(e)
-
-    # Fallback to urllib if curl is not installed
-    try:
-        proxy_handler = urllib.request.ProxyHandler({
-            "http": f"http://127.0.0.1:{port}",
-            "https": f"http://127.0.0.1:{port}",
-        })
-        opener = urllib.request.build_opener(proxy_handler)
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": USER_AGENT},
-        )
-        with opener.open(req, timeout=timeout) as resp:
-            code = resp.status
-            body = resp.read(2048).decode("utf-8", errors="replace").lower()
-    except urllib.error.HTTPError as e:
-        code = e.code
-        try:
-            body = e.read(2048).decode("utf-8", errors="replace").lower()
+            if res.stdout.strip() not in ("", "000"):
+                return True
         except Exception:
-            body = ""
-    except Exception as e:
-        err_msg = str(e).lower()
-        if "connection refused" in err_msg:
-            return False, "connection refused"
-        if "timed out" in err_msg:
-            return False, "timeout"
-        return False, f"connection failed: {e}"
-
-    if "location is not supported" in body or "failed_precondition" in body or "user location is not supported" in body:
-        return False, "location not supported"
-
-    if code in (200, 204, 400, 401, 403, 404):
-        return True, "ok"
-
-    return False, f"http {code}"
-
-
-def endpoint_ok(port: int, tries: int = 2, timeout: int = 5) -> bool:
-    """Can the current node reach Google AI endpoints? Verified with check_google_endpoint."""
-    for _ in range(tries):
-        ok, _ = check_google_endpoint(port, timeout=timeout)
-        if ok:
-            return True
-        time.sleep(0.3)
+            pass
+        time.sleep(0.4)
     return False
 
 
 def cmd_ensure() -> int:
-    """Used by the agy wrapper: make sure a node that can reach Google AI is up."""
+    """Used by the agy wrapper: make sure a node that can reach Google is up."""
     ensure_dirs()
     rt = load_json(RUNTIME, None)
     if not running(rt):
@@ -2919,55 +2107,28 @@ def cmd_ensure() -> int:
         rt = load_json(RUNTIME, None)
     mixed = int((rt or {}).get("mixed", PREF_MIXED_PORT))
 
-    ok, reason = check_google_endpoint(mixed, timeout=5)
-    geo = geo_lookup(mixed, timeout=4) if ok else None
-    if ok and (not geo or geo.get("country") not in BLOCKED_AI_COUNTRIES):
+    if endpoint_ok(mixed, tries=1, timeout=5):
         return 0
 
-    reason_str = f"exit in {geo.get('country')}" if (geo and geo.get("country") in BLOCKED_AI_COUNTRIES) else reason
-    say(dim(f"current node cannot reach Google AI ({reason_str}) - switching ..."))
+    say(dim("current node cannot reach Google - switching ..."))
     try:
         api("/proxies/PROXY", "PUT", {"name": "AUTO"})
     except Exception:
         pass
     group_test(3000)
-    ok, _ = check_google_endpoint(mixed, timeout=5)
-    geo = geo_lookup(mixed, timeout=4) if ok else None
-    if ok and (not geo or geo.get("country") not in BLOCKED_AI_COUNTRIES):
+    if endpoint_ok(mixed, tries=1, timeout=5):
         say(green("switched to an automatic node"))
         return 0
 
-    # Prioritize candidate nodes: preferred AI regions first, excluding blocked regions
-    all_nodes = node_list()
-    preferred: list[str] = []
-    others: list[str] = []
-    for name, _ptype, _delay in all_nodes:
-        cc = detect_country(name)
-        if cc and cc in BLOCKED_AI_COUNTRIES:
-            continue
-        if cc and cc in PREFERRED_AI_COUNTRIES:
-            preferred.append(name)
-        else:
-            others.append(name)
-
-    candidates = preferred + others
-    tested = 0
-    for name in candidates:
-        if tested >= 25:
-            break
+    for name, _ptype, _delay in node_list()[:5]:
         try:
             api("/proxies/PROXY", "PUT", {"name": name})
         except Exception:
             continue
         time.sleep(0.2)
-        ok, r = check_google_endpoint(mixed, timeout=5)
-        geo = geo_lookup(mixed, timeout=4) if ok else None
-        if ok and (not geo or geo.get("country") not in BLOCKED_AI_COUNTRIES):
-            exit_cc = geo.get("country", "") if geo else ""
-            suffix = f" [{exit_cc}]" if exit_cc else ""
-            say(green(f"switched to AI-ready node: {name}{suffix}"))
+        if endpoint_ok(mixed, tries=1, timeout=4):
+            say(green(f"using {name}"))
             return 0
-        tested += 1
 
     say(yellow("no node reached Google - try: fvpn -u"))
     return 1
